@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Any, Optional, List
 from datetime import datetime
 
 
@@ -10,10 +10,11 @@ class SelectionIn(BaseModel):
     Usn: Optional[str] = None
     Osn: Optional[str] = None
     Odd: Optional[float] = None
-    Bod: Optional[float] = None
-    Lod: Optional[float] = None
+    Bod: Optional[Any] = None   # can be null, float, or object with Ens ladder
+    Lod: Optional[Any] = None   # same
     Ui_n: Optional[str] = None
     Ui_t: Optional[str] = None
+    ResetReason: Optional[Any] = None
 
 
 class PregameMarketIn(BaseModel):

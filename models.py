@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
 
@@ -64,8 +64,8 @@ class Selection(Base):
     user_short_name = Column(String(50))
     original_short_name = Column(String(100))
     odd = Column(Float)
-    best_odd = Column(Float)
-    last_odd = Column(Float)
+    best_odd = Column(JSON)
+    last_odd = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     market = relationship("PregameMarket", back_populates="selections")

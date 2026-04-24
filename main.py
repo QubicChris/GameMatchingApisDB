@@ -49,8 +49,9 @@ app = FastAPI(
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    logger.error(f"422 Validation error on {request.method} {request.url}")
-    logger.error(f"Details: {exc.errors()}")
+    for error in exc.errors():
+        loc = " -> ".join(str(l) for l in error.get("loc", []))
+        logger.error(f"422 | {loc} | {error.get('msg')}")
     try:
         body = await request.body()
         _save_failed_payload(body)

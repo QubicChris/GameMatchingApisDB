@@ -2,7 +2,9 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from database import init_db, get_db
@@ -26,6 +28,22 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"422 Validation error on {request.method} {request.url}")
+    logger.error(f"Details: {exc.errors()}")
+    # Also log the raw body so you can see exactly what came in
+    try:
+        body = await request.body()
+        logger.error(f"Raw body (first 1000 chars): {body[:1000]}")
+    except Exception:
+        pass
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -93,11 +111,6 @@ def ingest_snapshot(
     payload: List[GameIn],
     db: Session = Depends(get_db),
 ):
-    """
-    Accepts the JSON array produced by System Two.
-    Deduplicates by (home_team, away_team, league, date_time_starts_utc)
-    and persists each new game with all its company games, markets, and selections.
-    """
     inserted, skipped, game_ids = 0, 0, []
 
     for game_payload in payload:

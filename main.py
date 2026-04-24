@@ -1,5 +1,9 @@
 import logging
+import json
+import os
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
@@ -13,6 +17,19 @@ from schemas import GameIn, GameOut, GameSummary, IngestResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+SAVE_FAILED_PAYLOADS = os.getenv("SAVE_FAILED_PAYLOADS", "true").lower() == "true"
+PAYLOADS_DIR = Path("payloads")
+
+
+def _save_failed_payload(body: bytes):
+    if not SAVE_FAILED_PAYLOADS:
+        return
+    PAYLOADS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    filename = PAYLOADS_DIR / f"payload_{timestamp}_FAILED.json"
+    filename.write_bytes(body)
+    logger.info(f"Failed payload saved to {filename}")
 
 
 @asynccontextmanager
@@ -34,16 +51,12 @@ app = FastAPI(
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     logger.error(f"422 Validation error on {request.method} {request.url}")
     logger.error(f"Details: {exc.errors()}")
-    # Also log the raw body so you can see exactly what came in
     try:
         body = await request.body()
-        logger.error(f"Raw body (first 1000 chars): {body[:1000]}")
+        _save_failed_payload(body)
     except Exception:
         pass
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors()},
-    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +120,20 @@ def _build_game(payload: GameIn) -> Game:
 # ---------------------------------------------------------------------------
 
 @app.post("/ingest", response_model=IngestResponse, summary="Ingest a snapshot batch from System Two")
-def ingest_snapshot(
-    payload: List[GameIn],
-    db: Session = Depends(get_db),
-):
+async def ingest_snapshot(request: Request, db: Session = Depends(get_db)):
+    body = await request.body()
+
+    try:
+        data = json.loads(body)
+        payload = [GameIn(**g) for g in data]
+    except Exception as e:
+        _save_failed_payload(body)
+        raise HTTPException(status_code=422, detail=str(e))
+
     inserted, skipped, game_ids = 0, 0, []
 
     for game_payload in payload:
         if _game_already_exists(db, game_payload):
-            logger.info(f"Skipping duplicate: {game_payload.HomeTeam} vs {game_payload.AwayTeam}")
             skipped += 1
             continue
 

@@ -19,17 +19,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SAVE_FAILED_PAYLOADS = os.getenv("SAVE_FAILED_PAYLOADS", "true").lower() == "true"
+SAVE_ALL_PAYLOADS = os.getenv("SAVE_ALL_PAYLOADS", "false").lower() == "true"
 PAYLOADS_DIR = Path("payloads")
+
+
+def _save_payload(body: bytes, suffix: str = ""):
+    PAYLOADS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    filename = PAYLOADS_DIR / f"payload_{timestamp}{suffix}.json"
+    filename.write_bytes(body)
+    logger.info(f"Payload saved to {filename}")
 
 
 def _save_failed_payload(body: bytes):
     if not SAVE_FAILED_PAYLOADS:
         return
-    PAYLOADS_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-    filename = PAYLOADS_DIR / f"payload_{timestamp}_FAILED.json"
-    filename.write_bytes(body)
-    logger.info(f"Failed payload saved to {filename}")
+    _save_payload(body, suffix="_FAILED")
 
 
 @asynccontextmanager
@@ -158,6 +163,9 @@ def _upsert_company_game(db: Session, game: Game, cg_in) -> tuple[CompanyGame, b
 @app.post("/ingest", response_model=IngestResponse, summary="Ingest a snapshot batch from System Two")
 async def ingest_snapshot(request: Request, db: Session = Depends(get_db)):
     body = await request.body()
+
+    if SAVE_ALL_PAYLOADS:
+        _save_payload(body)
 
     try:
         data = json.loads(body)

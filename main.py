@@ -64,29 +64,63 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _game_already_exists(db: Session, payload: GameIn) -> bool:
+def _get_existing_game(db: Session, payload: GameIn) -> Optional[Game]:
     return db.query(Game).filter(
         Game.home_team == payload.HomeTeam,
         Game.away_team == payload.AwayTeam,
         Game.date_time_starts_utc == payload.DateTimeStartsUTC,
         Game.league == payload.League,
-    ).first() is not None
+    ).first()
 
 
-def _build_game(payload: GameIn) -> Game:
-    game = Game(
-        date_time_starts_utc=payload.DateTimeStartsUTC,
-        home_team=payload.HomeTeam,
-        away_team=payload.AwayTeam,
-        league=payload.League,
-        country=payload.Country,
-        univ_home_id=payload.Univ_HomeId,
-        univ_away_id=payload.Univ_AwayId,
-        univ_league_id=payload.Univ_LeagueId,
-    )
-    for cg_in in payload.ListCompanyGames:
-        live = cg_in.LiveData
+def _upsert_company_game(db: Session, game: Game, cg_in) -> tuple[CompanyGame, bool]:
+    """
+    Find existing company game for this bookmaker, or create a new one.
+    Returns (company_game, was_updated).
+    """
+    live = cg_in.LiveData
+
+    existing = db.query(CompanyGame).filter(
+        CompanyGame.game_id == game.id,
+        CompanyGame.company_name == cg_in.CompanyName,
+    ).first()
+
+    if existing:
+        # Update live score data
+        existing.score_home = live.ScoreHome if live else None
+        existing.score_away = live.ScoreAway if live else None
+        existing.corners_home = live.CornersHome if live else None
+        existing.corners_away = live.CornersAway if live else None
+
+        # Delete old markets and selections — they'll be re-inserted fresh
+        for market in existing.markets:
+            db.delete(market)
+        db.flush()
+
+        # Re-insert markets and selections
+        for mkt_in in cg_in.PregameMarkets:
+            market = PregameMarket(
+                company_game_id=existing.id,
+                market_id=mkt_in.Id,
+                umid=mkt_in.Umid,
+                market_name=mkt_in.Omn,
+            )
+            for sel_in in mkt_in.Slcs:
+                market.selections.append(Selection(
+                    selection_id=sel_in.Id,
+                    user_short_name=sel_in.Usn,
+                    original_short_name=sel_in.Osn,
+                    odd=sel_in.Odd,
+                    best_odd=sel_in.Bod,
+                    last_odd=sel_in.Lod,
+                ))
+            db.add(market)
+
+        return existing, True
+
+    else:
         company_game = CompanyGame(
+            game_id=game.id,
             company_name=cg_in.CompanyName,
             home_team=cg_in.HomeTeam,
             away_team=cg_in.AwayTeam,
@@ -112,8 +146,9 @@ def _build_game(payload: GameIn) -> Game:
                     last_odd=sel_in.Lod,
                 ))
             company_game.markets.append(market)
-        game.company_games.append(company_game)
-    return game
+
+        db.add(company_game)
+        return company_game, False
 
 
 # ---------------------------------------------------------------------------
@@ -131,27 +166,48 @@ async def ingest_snapshot(request: Request, db: Session = Depends(get_db)):
         _save_failed_payload(body)
         raise HTTPException(status_code=422, detail=str(e))
 
-    inserted, skipped, game_ids = 0, 0, []
+    inserted, updated, game_ids = 0, 0, []
 
     for game_payload in payload:
-        if _game_already_exists(db, game_payload):
-            skipped += 1
-            continue
+        existing_game = _get_existing_game(db, game_payload)
 
-        game = _build_game(game_payload)
-        db.add(game)
-        db.flush()
-        game_ids.append(game.id)
-        inserted += 1
-        logger.info(f"Inserted game id={game.id}: {game_payload.HomeTeam} vs {game_payload.AwayTeam}")
+        if existing_game:
+            # Game exists — upsert each bookmaker
+            game_ids.append(existing_game.id)
+            for cg_in in game_payload.ListCompanyGames:
+                _, was_updated = _upsert_company_game(db, existing_game, cg_in)
+                if was_updated:
+                    updated += 1
+                    logger.info(f"Updated {cg_in.CompanyName} for game id={existing_game.id}: {game_payload.HomeTeam} vs {game_payload.AwayTeam}")
+        else:
+            # New game — insert everything fresh
+            game = Game(
+                date_time_starts_utc=game_payload.DateTimeStartsUTC,
+                home_team=game_payload.HomeTeam,
+                away_team=game_payload.AwayTeam,
+                league=game_payload.League,
+                country=game_payload.Country,
+                univ_home_id=game_payload.Univ_HomeId,
+                univ_away_id=game_payload.Univ_AwayId,
+                univ_league_id=game_payload.Univ_LeagueId,
+            )
+            db.add(game)
+            db.flush()
+
+            for cg_in in game_payload.ListCompanyGames:
+                _upsert_company_game(db, game, cg_in)
+
+            game_ids.append(game.id)
+            inserted += 1
+            logger.info(f"Inserted game id={game.id}: {game_payload.HomeTeam} vs {game_payload.AwayTeam}")
 
     db.commit()
 
     return IngestResponse(
         inserted=inserted,
-        skipped=skipped,
+        updated=updated,
         game_ids=game_ids,
-        message=f"Processed {len(payload)} game(s): {inserted} inserted, {skipped} skipped.",
+        message=f"Processed {len(payload)} game(s): {inserted} inserted, {updated} bookmaker(s) updated.",
     )
 
 

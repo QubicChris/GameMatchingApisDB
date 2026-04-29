@@ -130,6 +130,6 @@ class GameSummary(BaseModel):
 
 class IngestResponse(BaseModel):
     inserted: int
-    skipped: int
+    updated: int
     game_ids: List[int]
     message: str

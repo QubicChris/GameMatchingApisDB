@@ -91,13 +91,21 @@ class Selection(Base):
 
     odd = Column(Float)
 
-    # Flattened best_odd ladder (up to 3 positions)
-    bpf_pos1 = Column(Float)
-    bsz_pos1 = Column(Float)
-    bpf_pos2 = Column(Float)
-    bsz_pos2 = Column(Float)
-    bpf_pos3 = Column(Float)
-    bsz_pos3 = Column(Float)
+    # Flattened back (Bod) ladder — up to 3 positions
+    back_bpf_pos1 = Column(Float)
+    back_bsz_pos1 = Column(Float)
+    back_bpf_pos2 = Column(Float)
+    back_bsz_pos2 = Column(Float)
+    back_bpf_pos3 = Column(Float)
+    back_bsz_pos3 = Column(Float)
+
+    # Flattened lay (Lod) ladder — up to 3 positions
+    lay_bpf_pos1 = Column(Float)
+    lay_bsz_pos1 = Column(Float)
+    lay_bpf_pos2 = Column(Float)
+    lay_bsz_pos2 = Column(Float)
+    lay_bpf_pos3 = Column(Float)
+    lay_bsz_pos3 = Column(Float)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 

@@ -120,26 +120,33 @@ def _upsert_team_alias(db: Session, canonical_name: str, company_name: str, comp
         ))
 
 
-def _flatten_best_odd(bod) -> dict:
-    """Extract up to 3 positions from the Bod ladder into flat columns."""
+def _flatten_ladder(ladder, prefix: str) -> dict:
+    """Extract up to 3 positions from a Bod or Lod ladder into flat columns."""
     result = {
-        "bpf_pos1": None, "bsz_pos1": None,
-        "bpf_pos2": None, "bsz_pos2": None,
-        "bpf_pos3": None, "bsz_pos3": None,
+        f"{prefix}_bpf_pos1": None, f"{prefix}_bsz_pos1": None,
+        f"{prefix}_bpf_pos2": None, f"{prefix}_bsz_pos2": None,
+        f"{prefix}_bpf_pos3": None, f"{prefix}_bsz_pos3": None,
     }
-    if not bod or not isinstance(bod, dict):
+    if not ladder or not isinstance(ladder, dict):
         return result
-    ens = bod.get("Ens", [])
-    for entry in ens:
+    for entry in ladder.get("Ens", []):
         pos = str(entry.get("Pos", ""))
         bpf = entry.get("Bpf")
         bsz = entry.get("Bsz")
         if pos == "1":
-            result["bpf_pos1"], result["bsz_pos1"] = bpf, bsz
+            result[f"{prefix}_bpf_pos1"], result[f"{prefix}_bsz_pos1"] = bpf, bsz
         elif pos == "2":
-            result["bpf_pos2"], result["bsz_pos2"] = bpf, bsz
+            result[f"{prefix}_bpf_pos2"], result[f"{prefix}_bsz_pos2"] = bpf, bsz
         elif pos == "3":
-            result["bpf_pos3"], result["bsz_pos3"] = bpf, bsz
+            result[f"{prefix}_bpf_pos3"], result[f"{prefix}_bsz_pos3"] = bpf, bsz
+    return result
+
+
+def _flatten_best_odd(bod, lod) -> dict:
+    """Flatten both back (Bod) and lay (Lod) ladders."""
+    result = {}
+    result.update(_flatten_ladder(bod, "back"))
+    result.update(_flatten_ladder(lod, "lay"))
     return result
 
 
@@ -153,7 +160,7 @@ def _build_selections(mkt_in, home_team: str, away_team: str) -> List[Selection]
             home_team=home_team,
             away_team=away_team,
         )
-        bod = _flatten_best_odd(sel_in.Bod)
+        bod = _flatten_best_odd(sel_in.Bod, sel_in.Lod)
         selections.append(Selection(
             selection_id=sel_in.Id,
             canonical_outcome=norm["canonical_outcome"],

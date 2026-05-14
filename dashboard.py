@@ -175,7 +175,20 @@ def load_odds(game_id):
                  OR (so.choice_group IS NULL AND s.line_value IS NULL))
         WHERE g.id = :game_id
         GROUP BY pm.umid, mt.canonical_name, s.canonical_outcome, s.line_value
-        ORDER BY pm.umid, s.line_value, s.canonical_outcome
+        ORDER BY pm.umid, s.line_value,
+            CASE s.canonical_outcome
+                WHEN 'home'  THEN 1
+                WHEN 'draw'  THEN 2
+                WHEN 'away'  THEN 3
+                WHEN 'yes'   THEN 1
+                WHEN 'no'    THEN 2
+                WHEN 'over'  THEN 1
+                WHEN 'under' THEN 2
+                WHEN '1x'    THEN 1
+                WHEN 'x2'    THEN 2
+                WHEN '12'    THEN 3
+                ELSE 4
+            END
     """
     with engine.connect() as conn:
         return pd.read_sql(text(sql), conn, params={"game_id": game_id})

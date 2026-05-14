@@ -6,26 +6,26 @@ from datetime import datetime
 # --- Inbound (mirrors System Two JSON) ---
 
 class SelectionIn(BaseModel):
+    model_config = {"extra": "ignore"}
     Id: str
     Usn: Optional[str] = None
     Osn: Optional[str] = None
     Odd: Optional[float] = None
-    Bod: Optional[Any] = None   # can be null, float, or object with Ens ladder
-    Lod: Optional[Any] = None   # same
-    Ui_n: Optional[str] = None
-    Ui_t: Optional[str] = None
-    ResetReason: Optional[Any] = None
+    Bod: Optional[Any] = None
+    Lod: Optional[Any] = None
 
 
 class PregameMarketIn(BaseModel):
+    model_config = {"extra": "ignore"}
     Id: str
     Umid: Optional[int] = None
     Omn: Optional[str] = None
+    App_Umn: Optional[str] = None
     Slcs: List[SelectionIn] = []
-    Ui_n: Optional[str] = None
 
 
 class LiveDataIn(BaseModel):
+    model_config = {"extra": "ignore"}
     ScoreHome: Optional[int] = None
     ScoreAway: Optional[int] = None
     CornersHome: Optional[int] = None
@@ -33,6 +33,7 @@ class LiveDataIn(BaseModel):
 
 
 class CompanyGameIn(BaseModel):
+    model_config = {"extra": "ignore"}
     CompanyName: str
     DateTimeStartsUTC: Optional[datetime] = None
     HomeTeam: Optional[str] = None
@@ -45,6 +46,7 @@ class CompanyGameIn(BaseModel):
 
 
 class GameIn(BaseModel):
+    model_config = {"extra": "ignore"}
     DateTimeStartsUTC: datetime
     HomeTeam: str
     AwayTeam: str
@@ -61,11 +63,16 @@ class GameIn(BaseModel):
 class SelectionOut(BaseModel):
     id: int
     selection_id: Optional[str]
-    user_short_name: Optional[str]
-    original_short_name: Optional[str]
+    canonical_outcome: Optional[str]
+    line_value: Optional[float]
+    raw_outcome: Optional[str]
     odd: Optional[float]
-    best_odd: Optional[float]
-    last_odd: Optional[float]
+    bpf_pos1: Optional[float]
+    bsz_pos1: Optional[float]
+    bpf_pos2: Optional[float]
+    bsz_pos2: Optional[float]
+    bpf_pos3: Optional[float]
+    bsz_pos3: Optional[float]
 
     class Config:
         from_attributes = True
@@ -75,7 +82,6 @@ class MarketOut(BaseModel):
     id: int
     market_id: Optional[str]
     umid: Optional[int]
-    market_name: Optional[str]
     selections: List[SelectionOut] = []
 
     class Config:
@@ -92,6 +98,8 @@ class CompanyGameOut(BaseModel):
     score_away: Optional[int]
     corners_home: Optional[int]
     corners_away: Optional[int]
+    date_live_data_updated: Optional[datetime]
+    date_pregame_data_updated: Optional[datetime]
     markets: List[MarketOut] = []
 
     class Config:

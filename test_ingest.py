@@ -1,8 +1,7 @@
 import json
 import requests
 
-API_URL = "http://localhost:8000"
-
+API_URL = "http://134.209.73.229:9998/"
 # Load the demo snapshot
 with open("pregames-snapshot-demo(1).json", "r") as f:
     payload = json.load(f)

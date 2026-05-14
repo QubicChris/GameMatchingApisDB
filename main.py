@@ -12,14 +12,15 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from database import init_db, get_db
-from models import Game, CompanyGame, PregameMarket, Selection
+from models import Game, CompanyGame, PregameMarket, Selection, MarketType, TeamAlias
 from schemas import GameIn, GameOut, GameSummary, IngestResponse
+from normalizer import normalize
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SAVE_FAILED_PAYLOADS = os.getenv("SAVE_FAILED_PAYLOADS", "true").lower() == "true"
-SAVE_ALL_PAYLOADS = os.getenv("SAVE_ALL_PAYLOADS", "false").lower() == "true"
+SAVE_ALL_PAYLOADS    = os.getenv("SAVE_ALL_PAYLOADS", "false").lower() == "true"
 PAYLOADS_DIR = Path("payloads")
 
 
@@ -47,9 +48,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pregames Snapshot API",
     description="Ingests game snapshots from System Two and stores them.",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    import traceback
+    logger.error(f"500 error: {traceback.format_exc()}")
+    return JSONResponse(status_code=500, content={"detail": str(exc), "traceback": traceback.format_exc()})
 
 
 @app.exception_handler(RequestValidationError)
@@ -78,11 +86,87 @@ def _get_existing_game(db: Session, payload: GameIn) -> Optional[Game]:
     ).first()
 
 
-def _upsert_company_game(db: Session, game: Game, cg_in) -> tuple[CompanyGame, bool]:
+def _upsert_market_type(db: Session, umid: int, canonical_name: Optional[str]):
     """
-    Find existing company game for this bookmaker, or create a new one.
-    Returns (company_game, was_updated).
+    Insert or update a market_types row keyed on umid.
+    canonical_name comes from App_Umn and may be None.
+    An existing non-null canonical_name is never overwritten by None.
     """
+    if umid is None:
+        return
+    existing = db.query(MarketType).filter(MarketType.umid == umid).first()
+    if not existing:
+        db.add(MarketType(umid=umid, canonical_name=canonical_name))
+        db.flush()
+    else:
+        if canonical_name is not None:
+            existing.canonical_name = canonical_name
+        existing.last_updated_at = datetime.utcnow()
+
+
+def _upsert_team_alias(db: Session, canonical_name: str, company_name: str, company_team_name: str):
+    """Record how a bookmaker names a team. Only inserts, never updates — first seen wins."""
+    if not canonical_name or not company_team_name:
+        return
+    existing = db.query(TeamAlias).filter(
+        TeamAlias.canonical_name == canonical_name,
+        TeamAlias.company_name == company_name,
+    ).first()
+    if not existing:
+        db.add(TeamAlias(
+            canonical_name=canonical_name,
+            company_name=company_name,
+            company_team_name=company_team_name,
+        ))
+
+
+def _flatten_best_odd(bod) -> dict:
+    """Extract up to 3 positions from the Bod ladder into flat columns."""
+    result = {
+        "bpf_pos1": None, "bsz_pos1": None,
+        "bpf_pos2": None, "bsz_pos2": None,
+        "bpf_pos3": None, "bsz_pos3": None,
+    }
+    if not bod or not isinstance(bod, dict):
+        return result
+    ens = bod.get("Ens", [])
+    for entry in ens:
+        pos = str(entry.get("Pos", ""))
+        bpf = entry.get("Bpf")
+        bsz = entry.get("Bsz")
+        if pos == "1":
+            result["bpf_pos1"], result["bsz_pos1"] = bpf, bsz
+        elif pos == "2":
+            result["bpf_pos2"], result["bsz_pos2"] = bpf, bsz
+        elif pos == "3":
+            result["bpf_pos3"], result["bsz_pos3"] = bpf, bsz
+    return result
+
+
+def _build_selections(mkt_in, home_team: str, away_team: str) -> List[Selection]:
+    selections = []
+    for sel_in in mkt_in.Slcs:
+        norm = normalize(
+            umid=mkt_in.Umid,
+            osn=sel_in.Osn,
+            usn=sel_in.Usn,
+            home_team=home_team,
+            away_team=away_team,
+        )
+        bod = _flatten_best_odd(sel_in.Bod)
+        selections.append(Selection(
+            selection_id=sel_in.Id,
+            canonical_outcome=norm["canonical_outcome"],
+            line_value=norm["line_value"],
+            raw_outcome=norm["raw_outcome"],
+            odd=sel_in.Odd,
+            **bod,
+        ))
+    return selections
+
+
+def _upsert_company_game(db: Session, game: Game, cg_in, home_team: str, away_team: str):
+    """Upsert a bookmaker's data for a game. Returns (company_game, was_updated)."""
     live = cg_in.LiveData
 
     existing = db.query(CompanyGame).filter(
@@ -91,34 +175,47 @@ def _upsert_company_game(db: Session, game: Game, cg_in) -> tuple[CompanyGame, b
     ).first()
 
     if existing:
-        # Update live score data
         existing.score_home = live.ScoreHome if live else None
         existing.score_away = live.ScoreAway if live else None
         existing.corners_home = live.CornersHome if live else None
         existing.corners_away = live.CornersAway if live else None
+        existing.date_live_data_updated = cg_in.DateLiveDataUpdated
+        existing.date_pregame_data_updated = cg_in.DatePregameDataUpdated
 
-        # Delete old markets and selections — they'll be re-inserted fresh
-        for market in existing.markets:
-            db.delete(market)
+        # Bulk delete selections first, then markets (FK constraint order)
+        market_ids = [m.id for m in db.query(PregameMarket.id).filter(
+            PregameMarket.company_game_id == existing.id
+        ).all()]
+
+        if market_ids:
+            db.query(Selection).filter(
+                Selection.market_id.in_(market_ids)
+            ).delete(synchronize_session=False)
+
+        db.query(PregameMarket).filter(
+            PregameMarket.company_game_id == existing.id
+        ).delete(synchronize_session=False)
         db.flush()
 
-        # Re-insert markets and selections
+        # Record bookmaker team name aliases
+        if cg_in.HomeTeam:
+            _upsert_team_alias(db, home_team, cg_in.CompanyName, cg_in.HomeTeam)
+        if cg_in.AwayTeam:
+            _upsert_team_alias(db, away_team, cg_in.CompanyName, cg_in.AwayTeam)
+
+        seen_market_ids = set()
         for mkt_in in cg_in.PregameMarkets:
+            if mkt_in.Id in seen_market_ids:
+                logger.warning(f"Skipping duplicate market_id={mkt_in.Id} in payload")
+                continue
+            seen_market_ids.add(mkt_in.Id)
+            _upsert_market_type(db, mkt_in.Umid, mkt_in.App_Umn)
             market = PregameMarket(
                 company_game_id=existing.id,
                 market_id=mkt_in.Id,
                 umid=mkt_in.Umid,
-                market_name=mkt_in.Omn,
             )
-            for sel_in in mkt_in.Slcs:
-                market.selections.append(Selection(
-                    selection_id=sel_in.Id,
-                    user_short_name=sel_in.Usn,
-                    original_short_name=sel_in.Osn,
-                    odd=sel_in.Odd,
-                    best_odd=sel_in.Bod,
-                    last_odd=sel_in.Lod,
-                ))
+            market.selections = _build_selections(mkt_in, home_team, away_team)
             db.add(market)
 
         return existing, True
@@ -134,25 +231,31 @@ def _upsert_company_game(db: Session, game: Game, cg_in) -> tuple[CompanyGame, b
             score_away=live.ScoreAway if live else None,
             corners_home=live.CornersHome if live else None,
             corners_away=live.CornersAway if live else None,
+            date_live_data_updated=cg_in.DateLiveDataUpdated,
+            date_pregame_data_updated=cg_in.DatePregameDataUpdated,
         )
+        # Record bookmaker team name aliases
+        if cg_in.HomeTeam:
+            _upsert_team_alias(db, home_team, cg_in.CompanyName, cg_in.HomeTeam)
+        if cg_in.AwayTeam:
+            _upsert_team_alias(db, away_team, cg_in.CompanyName, cg_in.AwayTeam)
+
+        seen_market_ids = set()
         for mkt_in in cg_in.PregameMarkets:
+            if mkt_in.Id in seen_market_ids:
+                logger.warning(f"Skipping duplicate market_id={mkt_in.Id} in payload")
+                continue
+            seen_market_ids.add(mkt_in.Id)
+            _upsert_market_type(db, mkt_in.Umid, mkt_in.App_Umn)
             market = PregameMarket(
                 market_id=mkt_in.Id,
                 umid=mkt_in.Umid,
-                market_name=mkt_in.Omn,
             )
-            for sel_in in mkt_in.Slcs:
-                market.selections.append(Selection(
-                    selection_id=sel_in.Id,
-                    user_short_name=sel_in.Usn,
-                    original_short_name=sel_in.Osn,
-                    odd=sel_in.Odd,
-                    best_odd=sel_in.Bod,
-                    last_odd=sel_in.Lod,
-                ))
+            market.selections = _build_selections(mkt_in, home_team, away_team)
             company_game.markets.append(market)
 
         db.add(company_game)
+        db.flush()
         return company_game, False
 
 
@@ -162,7 +265,10 @@ def _upsert_company_game(db: Session, game: Game, cg_in) -> tuple[CompanyGame, b
 
 @app.post("/ingest", response_model=IngestResponse, summary="Ingest a snapshot batch from System Two")
 async def ingest_snapshot(request: Request, db: Session = Depends(get_db)):
+    received_at = datetime.utcnow()
     body = await request.body()
+
+    logger.info(f"[INGEST] Request received at {received_at.isoformat()}Z | body size={len(body)} bytes")
 
     if SAVE_ALL_PAYLOADS:
         _save_payload(body)
@@ -171,51 +277,73 @@ async def ingest_snapshot(request: Request, db: Session = Depends(get_db)):
         data = json.loads(body)
         payload = [GameIn(**g) for g in data]
     except Exception as e:
+        logger.error(f"[INGEST] Parse failed at {received_at.isoformat()}Z: {e}")
         _save_failed_payload(body)
         raise HTTPException(status_code=422, detail=str(e))
 
-    inserted, updated, game_ids = 0, 0, []
+    logger.info(f"[INGEST] Parsed {len(payload)} game(s) from payload")
+
+    inserted, updated, game_ids, failed = 0, 0, [], []
 
     for game_payload in payload:
-        existing_game = _get_existing_game(db, game_payload)
+        label = f"{game_payload.HomeTeam} vs {game_payload.AwayTeam} ({game_payload.League})"
+        try:
+            existing_game = _get_existing_game(db, game_payload)
 
-        if existing_game:
-            # Game exists — upsert each bookmaker
-            game_ids.append(existing_game.id)
-            for cg_in in game_payload.ListCompanyGames:
-                _, was_updated = _upsert_company_game(db, existing_game, cg_in)
-                if was_updated:
-                    updated += 1
-                    logger.info(f"Updated {cg_in.CompanyName} for game id={existing_game.id}: {game_payload.HomeTeam} vs {game_payload.AwayTeam}")
-        else:
-            # New game — insert everything fresh
-            game = Game(
-                date_time_starts_utc=game_payload.DateTimeStartsUTC,
-                home_team=game_payload.HomeTeam,
-                away_team=game_payload.AwayTeam,
-                league=game_payload.League,
-                country=game_payload.Country,
-                univ_home_id=game_payload.Univ_HomeId,
-                univ_away_id=game_payload.Univ_AwayId,
-                univ_league_id=game_payload.Univ_LeagueId,
-            )
-            db.add(game)
-            db.flush()
+            if existing_game:
+                game_ids.append(existing_game.id)
+                for cg_in in game_payload.ListCompanyGames:
+                    _, was_updated = _upsert_company_game(
+                        db, existing_game, cg_in,
+                        game_payload.HomeTeam, game_payload.AwayTeam
+                    )
+                    if was_updated:
+                        updated += 1
+                        logger.info(f"  [UPDATE] {cg_in.CompanyName} | game id={existing_game.id} | {label}")
+            else:
+                game = Game(
+                    date_time_starts_utc=game_payload.DateTimeStartsUTC,
+                    home_team=game_payload.HomeTeam,
+                    away_team=game_payload.AwayTeam,
+                    league=game_payload.League,
+                    country=game_payload.Country,
+                    univ_home_id=game_payload.Univ_HomeId,
+                    univ_away_id=game_payload.Univ_AwayId,
+                    univ_league_id=game_payload.Univ_LeagueId,
+                )
+                db.add(game)
+                db.flush()
 
-            for cg_in in game_payload.ListCompanyGames:
-                _upsert_company_game(db, game, cg_in)
+                bookmakers = []
+                for cg_in in game_payload.ListCompanyGames:
+                    _upsert_company_game(db, game, cg_in, game_payload.HomeTeam, game_payload.AwayTeam)
+                    bookmakers.append(cg_in.CompanyName)
 
-            game_ids.append(game.id)
-            inserted += 1
-            logger.info(f"Inserted game id={game.id}: {game_payload.HomeTeam} vs {game_payload.AwayTeam}")
+                game_ids.append(game.id)
+                inserted += 1
+                logger.info(f"  [INSERT] game id={game.id} | {label} | bookmakers={bookmakers}")
+
+        except Exception as e:
+            logger.error(f"  [FAILED] {label} | error={e}")
+            failed.append(label)
+            db.rollback()
 
     db.commit()
+
+    elapsed = (datetime.utcnow() - received_at).total_seconds()
+    logger.info(
+        f"[INGEST] Done in {elapsed:.2f}s | "
+        f"total={len(payload)} | inserted={inserted} | updated={updated} | failed={len(failed)}"
+    )
+    if failed:
+        logger.warning(f"[INGEST] Failed games: {failed}")
 
     return IngestResponse(
         inserted=inserted,
         updated=updated,
         game_ids=game_ids,
-        message=f"Processed {len(payload)} game(s): {inserted} inserted, {updated} bookmaker(s) updated.",
+        message=f"Processed {len(payload)} game(s): {inserted} inserted, {updated} bookmaker(s) updated."
+        + (f" {len(failed)} failed." if failed else ""),
     )
 
 

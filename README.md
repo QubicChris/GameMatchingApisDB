@@ -96,11 +96,11 @@ SAVE_ALL_PAYLOADS=false     # Save every incoming payload (default: false)
 ## Running the API
 
 ```powershell
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 0.0.0.0 --port 9998 --reload
 ```
 
 Tables are auto-created on first startup.  
-Interactive API docs: `http://localhost:8000/docs`
+Interactive API docs: `http://localhost:9998/docs`
 
 ### Key endpoints
 
@@ -116,7 +116,7 @@ Interactive API docs: `http://localhost:8000/docs`
 ## Running the Dashboard
 
 ```powershell
-streamlit run dashboard.py
+streamlit run dashboard.py --server.port 9996 --server.address 0.0.0.0
 ```
 
 Pages:

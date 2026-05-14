@@ -1,11 +1,14 @@
 """
 Pregames Data Browser
 Run with: streamlit run dashboard.py
-Requires DATABASE_URL in .env
+Requires DATABASE_URL in .env and auth.yaml for user credentials.
+Generate auth.yaml with: python make_auth.py
 """
 import os
+import yaml
 import streamlit as st
 import pandas as pd
+import streamlit_authenticator as stauth
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
@@ -13,10 +16,44 @@ load_dotenv()
 
 st.set_page_config(
     page_title="Pregames Browser",
-    page_icon="⚡",
+    page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ── Authentication ────────────────────────────────────────────────────────────
+
+AUTH_FILE = os.path.join(os.path.dirname(__file__), "auth.yaml")
+
+if not os.path.exists(AUTH_FILE):
+    st.error("auth.yaml not found. Run `python make_auth.py` to create it.")
+    st.stop()
+
+with open(AUTH_FILE) as f:
+    auth_config = yaml.safe_load(f)
+
+authenticator = stauth.Authenticate(
+    auth_config["credentials"],
+    auth_config["cookie"]["name"],
+    auth_config["cookie"]["key"],
+    auth_config["cookie"]["expiry_days"],
+)
+
+authenticator.login()
+
+if st.session_state.get("authentication_status") is False:
+    st.error("Incorrect username or password.")
+    st.stop()
+
+if st.session_state.get("authentication_status") is None:
+    st.warning("Please enter your username and password.")
+    st.stop()
+
+# Logged in — show logout button in sidebar
+with st.sidebar:
+    authenticator.logout("Logout", "sidebar")
+    st.caption(f"Logged in as **{st.session_state.get('name')}**")
+    st.markdown("---")
 
 # ── DB connection ─────────────────────────────────────────────────────────────
 
@@ -284,7 +321,7 @@ def load_market_types():
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## ⚡ Pregames")
+    st.markdown("## ⚽ Pregames")
     st.markdown("---")
 
     try:

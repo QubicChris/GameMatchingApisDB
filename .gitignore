@@ -1,4 +1,6 @@
 /.env
+/auth.yaml
+/make_auth2.py
 /.venv
 /__pycache__
 /payloads2

@@ -212,10 +212,10 @@ def _upsert_company_game(db: Session, game: Game, cg_in, home_team: str, away_te
 
         seen_market_ids = set()
         for mkt_in in cg_in.PregameMarkets:
-            if mkt_in.Id in seen_market_ids:
+            if (mkt_in.Id, mkt_in.Umid) in seen_market_ids:
                 logger.warning(f"Skipping duplicate market_id={mkt_in.Id} in payload")
                 continue
-            seen_market_ids.add(mkt_in.Id)
+            seen_market_ids.add((mkt_in.Id, mkt_in.Umid))
             _upsert_market_type(db, mkt_in.Umid, mkt_in.App_Umn)
             market = PregameMarket(
                 company_game_id=existing.id,
@@ -249,10 +249,10 @@ def _upsert_company_game(db: Session, game: Game, cg_in, home_team: str, away_te
 
         seen_market_ids = set()
         for mkt_in in cg_in.PregameMarkets:
-            if mkt_in.Id in seen_market_ids:
+            if (mkt_in.Id, mkt_in.Umid) in seen_market_ids:
                 logger.warning(f"Skipping duplicate market_id={mkt_in.Id} in payload")
                 continue
-            seen_market_ids.add(mkt_in.Id)
+            seen_market_ids.add((mkt_in.Id, mkt_in.Umid))
             _upsert_market_type(db, mkt_in.Umid, mkt_in.App_Umn)
             market = PregameMarket(
                 market_id=mkt_in.Id,

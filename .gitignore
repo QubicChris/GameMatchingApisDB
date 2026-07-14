@@ -7,3 +7,8 @@
 /payloads3
 /sofa_calls
 /old_files
+/payloads*
+payload*
+*.json
+yo3.py
+dedup.py

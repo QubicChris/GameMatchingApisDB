@@ -6,9 +6,12 @@ writes sofa_event_id back to the games table.
 
 Usage:
     python batch_match_sofa.py --date 2026-05-12
+    python batch_match_sofa.py --dates 2026-05-12 2026-05-13
+    python batch_match_sofa.py --dates 2026-05-12,2026-05-13
     python batch_match_sofa.py --date 2026-05-12 --dry-run       # match but don't write
     python batch_match_sofa.py --date 2026-05-12 --unmatched-only # skip already matched
     python batch_match_sofa.py --date 2026-05-12 --min-confidence 70
+    python batch_match_sofa.py --date 2026-05-12 --report        # save JSON report to reports/
 """
 import argparse
 import calendar
@@ -45,38 +48,102 @@ TIME_WINDOW_MINUTES   = 30
 # Delay between API calls to avoid rate limiting (seconds)
 API_CALL_DELAY = 0.5
 
+# RapidAPI quota resets on the 18th of each month; stop calling once this many
+# calls have been logged in the current cycle.
+BILLING_CYCLE_DAY  = 18
+MONTHLY_CALL_LIMIT = 9990
+
 # Sofasport odds provider (1 = Bet365)
 ODDS_PROVIDER_ID = int(os.getenv("ODDS_PROVIDER_ID", "1"))
 
 CATEGORY_MAP = {
-    "Afghanistan": 1084, "Albania": 69, "Algeria": 304, "Angola": 500,
-    "Argentina": 48, "Armenia": 296, "Australia": 34, "Austria": 43,
-    "Azerbaijan": 297, "Bahrain": 351, "Belarus": 73, "Belgium": 33,
-    "Bolivia": 379, "Bosnia": 332, "Brazil": 13, "Bulgaria": 78,
-    "Chile": 49, "China": 17, "Colombia": 274, "Costa Rica": 113,
-    "Croatia": 14, "Cyprus": 102, "Czech Republic": 41, "Denmark": 8,
-    "Ecuador": 165, "Egypt": 305, "England": 1, "Estonia": 157,
+    "Afghanistan": 1084, "Albania": 257, "Algeria": 304, "Angola": 500,
+    "Argentina": 48, "Armenia": 296, "Australia": 34, "Austria": 17,
+    "Azerbaijan": 297, "Bahrain": 351, "Belarus": 91, "Belgium": 33,
+    "Bolivia": 379, "Bosnia": 158, "Brazil": 13, "Bulgaria": 78,
+    "Chile": 49, "China": 99, "Colombia": 274, "Costa Rica": 289,
+    "Croatia": 14, "Cyprus": 102, "Czech Republic": 18, "Denmark": 8,
+    "Ecuador": 165, "Egypt": 305, "England": 1, "Estonia": 92,
     "Europe": 1465, "Finland": 19, "France": 7, "Georgia": 270,
-    "Germany": 30, "Ghana": 443, "Greece": 67, "Honduras": 437,
-    "Hong Kong": 339, "Hungary": 29, "Iceland": 10, "India": 352,
-    "Indonesia": 368, "Iran": 388, "Ireland": 51, "Israel": 66,
-    "Italy": 31, "Jamaica": 475, "Japan": 52, "Jordan": 340,
-    "Kazakhstan": 148, "Kenya": 453, "Kosovo": 317, "Kuwait": 341,
-    "Latvia": 163, "Lebanon": 350, "Lithuania": 160, "Luxembourg": 110,
-    "Malaysia": 85, "Malta": 111, "Mexico": 56, "Moldova": 75,
-    "Montenegro": 333, "Morocco": 311, "Netherlands": 35, "New Zealand": 190,
-    "Nicaragua": 469, "Nigeria": 444, "North & Central America": 1469,
-    "North Macedonia": 159, "Northern Ireland": 127, "Norway": 5,
-    "Oman": 354, "Panama": 468, "Paraguay": 58, "Peru": 20,
+    "Germany": 30, "Ghana": 542, "Greece": 67, "Honduras": 437,
+    "Hong Kong": 339, "Hungary": 11, "Iceland": 10, "India": 352,
+    "Indonesia": 368, "Iran": 301, "Ireland": 51, "Israel": 66,
+    "UEFA": 1465,
+    "FIFA": 1468,
+    "World": 1468,
+    "Italy": 31, "Jamaica": 502, "Japan": 52, "Jordan": 329,
+    "Kazakhstan": 278, "Kenya": 805, "Kosovo": 1112, "Kuwait": 331,
+    "Latvia": 163, "Lebanon": 428, "Lithuania": 160, "Luxembourg": 197,
+    "Malaysia": 85, "Malta": 134, "Mexico": 12, "Moldova": 279,
+    "Montenegro": 386, "Morocco": 303, "Netherlands": 35, "New Zealand": 148,
+    "Nicaragua": 1130, "Nigeria": 1132, "North & Central America": 1469,
+    "North Macedonia": 159, "Northern Ireland": 130, "Norway": 5,
+    "Oman": 415, "Panama": 526, "Paraguay": 280, "Peru": 20,
     "Philippines": 847, "Poland": 47, "Portugal": 44, "Qatar": 353,
     "Romania": 77, "Russia": 21, "Saudi Arabia": 310, "Scotland": 22,
-    "Serbia": 152, "Singapore": 45, "Slovakia": 40, "Slovenia": 76,
-    "South America": 1470, "South Korea": 55, "Spain": 32, "Sweden": 9,
-    "Switzerland": 42, "Tanzania": 507, "Thailand": 485, "Tunisia": 312,
+    "Serbia": 152, "Singapore": 45, "Slovakia": 23, "Slovenia": 24,
+    "South America": 1470, "South Korea": 291, "Spain": 32, "Sweden": 9,
+    "Switzerland": 25, "Tanzania": 1151, "Thailand": 485, "Tunisia": 378,
     "Turkey": 46, "USA": 26, "Uganda": 1022, "Ukraine": 86,
-    "Uruguay": 57, "Uzbekistan": 385, "Venezuela": 264, "Wales": 129,
-    "Zambia": 540,
+    "Uruguay": 57, "Uzbekistan": 385, "Venezuela": 281, "Wales": 131,
+    "Zambia": 1158,
 }
+
+
+# ---------------------------------------------------------------------------
+# API call logging
+# ---------------------------------------------------------------------------
+
+def log_api_call(endpoint: str):
+    """Log a single RapidAPI call to the api_call_log table."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO api_call_log (provider, endpoint, called_at)
+                VALUES ('rapidapi', :endpoint, NOW())
+            """), {"endpoint": endpoint})
+    except Exception as e:
+        logger.warning(f"Failed to log API call: {e}")
+
+
+def save_report(date: str, report: dict):
+    """Save match report to reports/<date>.json"""
+    folder = Path("reports")
+    folder.mkdir(exist_ok=True)
+    path = folder / f"{date}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False, default=str)
+    print(f"  Report saved → {path}")
+    return path
+
+
+def get_billing_cycle_start(reference: datetime = None) -> datetime:
+    """
+    RapidAPI quota resets on the 18th of each month. Returns the start
+    (00:00 UTC) of the current cycle — the most recent 18th on or before
+    `reference` (e.g. on 2026-07-06 this returns 2026-06-18).
+    """
+    reference = reference or datetime.utcnow()
+    if reference.day >= BILLING_CYCLE_DAY:
+        return reference.replace(day=BILLING_CYCLE_DAY, hour=0, minute=0, second=0, microsecond=0)
+    year, month = reference.year, reference.month - 1
+    if month == 0:
+        month, year = 12, year - 1
+    return reference.replace(year=year, month=month, day=BILLING_CYCLE_DAY, hour=0, minute=0, second=0, microsecond=0)
+
+
+def get_cycle_call_count(cycle_start: datetime) -> int:
+    """Return the number of RapidAPI calls logged since `cycle_start`."""
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT COUNT(*) FROM api_call_log
+                WHERE provider = 'rapidapi' AND called_at >= :cycle_start
+            """), {"cycle_start": cycle_start})
+            return result.scalar() or 0
+    except Exception as e:
+        logger.warning(f"Failed to get cycle call count: {e}")
+        return -1
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +255,8 @@ def fetch_sofa_events(country: str, date: str) -> list[dict]:
     with urllib.request.urlopen(req, timeout=15) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 
+    log_api_call(f"events/schedule/category/{country}")
+
     return [
         {
             "id":         e["id"],
@@ -207,38 +276,118 @@ def fetch_sofa_events(country: str, date: str) -> list[dict]:
 # Matching
 # ---------------------------------------------------------------------------
 
-def fuzzy_name_score(db_home: str, db_away: str, sofa_event: dict) -> float:
-    h = fuzz.token_sort_ratio(db_home.lower(), sofa_event["home"].lower())
-    a = fuzz.token_sort_ratio(db_away.lower(), sofa_event["away"].lower())
+def load_team_aliases() -> dict[str, str]:
+    """
+    Load confirmed DB-team-name -> Sofasport-name mappings from past matches,
+    so recurring name mismatches (rebrands, translations, sponsor names)
+    don't have to be re-solved by fuzzy text every run.
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT canonical_name, company_team_name
+                FROM team_aliases
+                WHERE company_name = 'Sofasport'
+            """)).fetchall()
+        return {r.canonical_name: r.company_team_name for r in rows}
+    except Exception as e:
+        logger.warning(f"Failed to load team aliases: {e}")
+        return {}
+
+
+def fuzzy_name_score(db_home: str, db_away: str, sofa_event: dict, aliases: dict[str, str] | None = None) -> float:
+    aliases = aliases or {}
+
+    if aliases.get(db_home) == sofa_event["home"]:
+        h = 100.0
+    else:
+        h = fuzz.token_sort_ratio(db_home.lower(), sofa_event["home"].lower())
+
+    if aliases.get(db_away) == sofa_event["away"]:
+        a = 100.0
+    else:
+        a = fuzz.token_sort_ratio(db_away.lower(), sofa_event["away"].lower())
+
     return (h + a) / 2
 
 
-def match_game(db_game: dict, sofa_events: list[dict]) -> tuple[dict | None, str, float]:
-    db_epoch = calendar.timegm(db_game["date_time_starts_utc"].timetuple())
+def score_pair(db_game: dict, sofa_event: dict, aliases: dict[str, str] | None = None) -> tuple[float, str]:
+    """
+    Return (confidence, method) for a single DB game vs sofa event pair,
+    without committing to any assignment. Used to build the cost matrix.
+    """
+    db_epoch    = calendar.timegm(db_game["date_time_starts_utc"].timetuple())
     window_secs = TIME_WINDOW_MINUTES * 60
 
-    candidates = [e for e in sofa_events if abs(e["ts"] - db_epoch) <= window_secs]
-    if not candidates:
-        return None, "NO_TIME", 0.0
+    if abs(sofa_event["ts"] - db_epoch) > window_secs:
+        return 0.0, "NO_TIME"
+
+    name_score = fuzzy_name_score(db_game["home_team"], db_game["away_team"], sofa_event, aliases)
 
     sh, sa = db_game["score_home"], db_game["score_away"]
     if sh is not None and sa is not None:
-        score_matches = [e for e in candidates if e["score_home"] == sh and e["score_away"] == sa]
-        if len(score_matches) == 1:
-            name_score = fuzzy_name_score(db_game["home_team"], db_game["away_team"], score_matches[0])
+        if sofa_event["score_home"] == sh and sofa_event["score_away"] == sa:
             if name_score >= SCORE_MATCH_THRESHOLD:
-                return score_matches[0], "SCORE", 100.0
-        if len(score_matches) > 1:
-            best = max(score_matches, key=lambda e: fuzzy_name_score(db_game["home_team"], db_game["away_team"], e))
-            score = fuzzy_name_score(db_game["home_team"], db_game["away_team"], best)
-            if score >= SCORE_MATCH_THRESHOLD:
-                return best, "SCORE+FUZZY", score
+                return 100.0, "SCORE"
+            return name_score, "SCORE+FUZZY"
 
-    best = max(candidates, key=lambda e: fuzzy_name_score(db_game["home_team"], db_game["away_team"], e))
-    score = fuzzy_name_score(db_game["home_team"], db_game["away_team"], best)
-    if score >= FUZZY_MATCH_THRESHOLD:
-        return best, "FUZZY", score
-    return best, "MISS", score
+    if name_score >= FUZZY_MATCH_THRESHOLD:
+        return name_score, "FUZZY"
+    return name_score, "MISS"
+
+
+def match_country_optimal(
+    db_games: list[dict],
+    sofa_events: list[dict],
+    min_confidence: float,
+    aliases: dict[str, str] | None = None,
+) -> list[tuple[dict, dict | None, str, float]]:
+    """
+    Optimally assign DB games to sofa events using the Hungarian algorithm
+    so that no two DB games claim the same sofa event and the total
+    confidence across all assignments is maximised.
+
+    Returns a list of (db_game, sofa_event_or_None, method, confidence)
+    one entry per DB game.
+    """
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+
+    n_db   = len(db_games)
+    n_sofa = len(sofa_events)
+
+    # Build score matrix  [n_db x n_sofa]
+    score_matrix  = np.zeros((n_db, n_sofa))
+    method_matrix = [["NO_TIME"] * n_sofa for _ in range(n_db)]
+
+    for i, g in enumerate(db_games):
+        for j, e in enumerate(sofa_events):
+            conf, meth = score_pair(g, e, aliases)
+            score_matrix[i, j]  = conf
+            method_matrix[i][j] = meth
+
+    # linear_sum_assignment minimises cost — negate to maximise
+    row_ind, col_ind = linear_sum_assignment(-score_matrix)
+    assigned_cols = dict(zip(row_ind.tolist(), col_ind.tolist()))
+
+    results = []
+    for i, g in enumerate(db_games):
+        if i not in assigned_cols:
+            # More DB games than sofa events — no candidate at all
+            results.append((g, None, "NO_TIME", 0.0))
+            continue
+
+        j          = assigned_cols[i]
+        confidence = float(score_matrix[i, j])
+        method     = method_matrix[i][j]
+        sofa       = sofa_events[j]
+
+        if method == "NO_TIME" or confidence < min_confidence:
+            results.append((g, sofa, "MISS" if method != "NO_TIME" else "NO_TIME", confidence))
+        else:
+            results.append((g, sofa, method, confidence))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +407,11 @@ def fetch_sofa_odds(sofa_event_id: int) -> list[dict]:
         method="GET"
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8")).get("data", [])
+        data = json.loads(resp.read().decode("utf-8"))
+
+    log_api_call(f"events/odds/{sofa_event_id}")
+
+    return data.get("data", [])
 
 
 def fetch_sofa_statistics(sofa_event_id: int) -> list[dict]:
@@ -270,7 +423,11 @@ def fetch_sofa_statistics(sofa_event_id: int) -> list[dict]:
         method="GET"
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8")).get("data", [])
+        data = json.loads(resp.read().decode("utf-8"))
+
+    log_api_call(f"events/statistics/{sofa_event_id}")
+
+    return data.get("data", [])
 
 
 SOFA_CALLS_DIR = Path("sofa_calls")
@@ -377,11 +534,12 @@ def store_statistics(game_id: int, sofa_event_id: int, raw_stats: list[dict], da
 # Main
 # ---------------------------------------------------------------------------
 
-def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, min_games: int):
+def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, min_games: int, report: bool = False):
     if not RAPIDAPI_KEY:
         raise ValueError("RAPIDAPI_KEY not set in .env")
 
     by_country = load_db_games(date, unmatched_only)
+    aliases    = load_team_aliases()
 
     # Split into countries we can call vs ones with no category mapping
     callable_countries  = {c: g for c, g in by_country.items() if c in CATEGORY_MAP}
@@ -393,27 +551,48 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
 
     total_games = sum(len(g) for g in by_country.values())
 
+    # RapidAPI call count for the current billing cycle (18th → 18th) BEFORE this run
+    cycle_start  = get_billing_cycle_start()
+    calls_before = get_cycle_call_count(cycle_start)
+    calls_used   = calls_before
+
     print()
     print(f"  Batch Sofasport Match — {date}")
     print(f"  {'='*65}")
-    print(f"  Total games       : {total_games}")
-    print(f"  Min games filter  : {min_games}")
-    print(f"  Countries to call : {len(callable_countries)}")
-    print(f"  Below threshold   : {len(below_threshold)}" + (f" {[(c, len(g)) for c, g in below_threshold.items()]}" if below_threshold else ""))
-    print(f"  Skipped countries : {len(skipped_countries)}" + (f" {list(skipped_countries)}" if skipped_countries else ""))
-    print(f"  Min confidence    : {min_confidence}")
-    print(f"  Dry run           : {dry_run}")
+    print(f"  Total games          : {total_games}")
+    print(f"  Min games filter     : {min_games}")
+    print(f"  Countries to call    : {len(callable_countries)}")
+    print(f"  Below threshold      : {len(below_threshold)}" + (f" {[(c, len(g)) for c, g in below_threshold.items()]}" if below_threshold else ""))
+    print(f"  Skipped countries    : {len(skipped_countries)}" + (f" {list(skipped_countries)}" if skipped_countries else ""))
+    print(f"  Min confidence       : {min_confidence}")
+    print(f"  Dry run              : {dry_run}")
+    print(f"  RapidAPI calls (cycle since {cycle_start.date()}) : {calls_before} / {MONTHLY_CALL_LIMIT} (before this run)")
     print()
+
+    if calls_before >= MONTHLY_CALL_LIMIT:
+        print(f"  ABORTING — RapidAPI call limit reached ({calls_before}/{MONTHLY_CALL_LIMIT} since {cycle_start.date()}). No requests made.")
+        return
 
     grand_matched = grand_missed = grand_skipped = 0
     all_to_write  = []   # (game_id, sofa_id, sofa_event_dict)
     all_misses    = []   # (game, method, confidence)
+    report_rows         = []   # all games for the JSON report
+    sofa_unmatched_rows = []   # sofa events that were never claimed by any DB game
 
-    for country, db_games in sorted(callable_countries.items()):
+    remaining_countries = sorted(callable_countries.items())
+    for idx, (country, db_games) in enumerate(remaining_countries):
+        if calls_used >= MONTHLY_CALL_LIMIT:
+            not_run = remaining_countries[idx:]
+            print(f"  RapidAPI call limit reached ({calls_used}/{MONTHLY_CALL_LIMIT}) — stopping, "
+                  f"skipping {len(not_run)} remaining countr{'y' if len(not_run) == 1 else 'ies'}.")
+            grand_skipped += sum(len(g) for _, g in not_run)
+            break
+
         print(f"  [{country}] {len(db_games)} game(s) — fetching...", end=" ", flush=True)
 
         try:
             sofa_events = fetch_sofa_events(country, date)
+            calls_used += 1
             print(f"{len(sofa_events)} sofa events")
         except Exception as e:
             print(f"API ERROR: {e}")
@@ -423,10 +602,11 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
         time.sleep(API_CALL_DELAY)
 
         matched = missed = 0
-        for g in db_games:
-            sofa, method, confidence = match_game(g, sofa_events)
+        matched_sofa_ids = set()
+        assignments = match_country_optimal(db_games, sofa_events, min_confidence, aliases)
 
-            if method in ("NO_TIME", "MISS") or confidence < min_confidence:
+        for g, sofa, method, confidence in assignments:
+            if method in ("NO_TIME", "MISS"):
                 missed += 1
                 grand_missed += 1
                 all_misses.append((g, method, confidence))
@@ -434,6 +614,7 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
             else:
                 matched += 1
                 grand_matched += 1
+                matched_sofa_ids.add(sofa["id"])
                 all_to_write.append((g["id"], sofa["id"], sofa))
                 status = "✓"
 
@@ -441,8 +622,41 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
             sofa_label = f"{sofa['home']} vs {sofa['away']} (id={sofa['id']})" if sofa else "— NO MATCH —"
             print(f"    {status} [{g['id']:>5}] {method:<12} {confidence:>4.0f}  {db_label:<40} {sofa_label}")
 
+            report_rows.append({
+                "game_id":        g["id"],
+                "status":         "matched" if status == "✓" else "unmatched",
+                "method":         method,
+                "confidence":     round(confidence, 1),
+                "country":        g["country"],
+                "league":         g["league"],
+                "db_home":        g["home_team"],
+                "db_away":        g["away_team"],
+                "db_kickoff_utc": str(g["date_time_starts_utc"]),
+                "db_score":       f"{g['score_home']}-{g['score_away']}" if g["score_home"] is not None else None,
+                "sofa_id":        sofa["id"]   if sofa else None,
+                "sofa_home":      sofa["home"] if sofa else None,
+                "sofa_away":      sofa["away"] if sofa else None,
+                "sofa_score":     f"{sofa['score_home']}-{sofa['score_away']}" if sofa and sofa.get("score_home") is not None else None,
+                "sofa_league":    sofa["league"] if sofa else None,
+            })
+
         print(f"    → matched {matched}/{len(db_games)}")
         print()
+
+        # Collect sofa events that no DB game claimed
+        for e in sofa_events:
+            if e["id"] not in matched_sofa_ids:
+                sofa_unmatched_rows.append({
+                    "sofa_id":     e["id"],
+                    "country":     country,
+                    "sofa_home":   e["home"],
+                    "sofa_away":   e["away"],
+                    "sofa_league": e["league"],
+                    "sofa_score":  f"{e['score_home']}-{e['score_away']}" if e.get("score_home") is not None else None,
+                    "sofa_status": e.get("status"),
+                    "sofa_ts":     e["ts"],
+                    "kickoff_utc": datetime.utcfromtimestamp(e["ts"]).isoformat() if e.get("ts") else None,
+                })
 
     # ── Write sofa_event_ids to DB ────────────────────────────────────────────
     if all_to_write:
@@ -456,12 +670,20 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
         print()
         print(f"  Fetching odds + statistics for {len(all_to_write)} matched game(s)...")
         for i, (game_id, sofa_id, _sofa_event) in enumerate(all_to_write, 1):
+            if calls_used + 2 > MONTHLY_CALL_LIMIT:
+                skipped_odds_stats = len(all_to_write) - i + 1
+                print(f"  RapidAPI call limit reached ({calls_used}/{MONTHLY_CALL_LIMIT}) — stopping, "
+                      f"skipping odds/statistics for {skipped_odds_stats} remaining game(s).")
+                break
+
             try:
                 raw_odds = fetch_sofa_odds(sofa_id)
+                calls_used += 1
                 store_odds(game_id, sofa_id, raw_odds, date)
                 time.sleep(API_CALL_DELAY)
 
                 raw_stats = fetch_sofa_statistics(sofa_id)
+                calls_used += 1
                 store_statistics(game_id, sofa_id, raw_stats, date)
                 time.sleep(API_CALL_DELAY)
 
@@ -478,21 +700,89 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
             print(f"    [{g['id']:>5}] {method:<10} conf={confidence:>4.0f}  {g['home_team']} vs {g['away_team']} ({g['country']})")
 
     # ── Grand summary ─────────────────────────────────────────────────────────
+    calls_after    = get_cycle_call_count(cycle_start)
+    calls_this_run = calls_after - calls_before if calls_before >= 0 else "N/A"
+
     print()
     print(f"  {'='*65}")
     print(f"  Matched  : {grand_matched}")
     print(f"  Missed   : {grand_missed}")
-    print(f"  Skipped  : {grand_skipped} (API errors)")
+    print(f"  Skipped  : {grand_skipped} (API errors / call-limit stop)")
     if skipped_countries:
-        print(f"  No category mapping: {list(skipped_countries.keys())}")
+        print(f"  No category mapping : {list(skipped_countries.keys())}")
+    print(f"  {'='*65}")
+    print(f"  RapidAPI calls this run              : {calls_this_run}")
+    print(f"  RapidAPI calls (cycle since {cycle_start.date()}) : {calls_after} / {MONTHLY_CALL_LIMIT}")
+    print()
+
+    # ── Save JSON report ──────────────────────────────────────────────────────
+    if report:
+        report_data = {
+            "date":              date,
+            "generated_at":      datetime.utcnow().isoformat(),
+            "dry_run":           dry_run,
+            "min_confidence":    min_confidence,
+            "summary": {
+                "total_games":           grand_matched + grand_missed + grand_skipped,
+                "matched":               grand_matched,
+                "unmatched":             grand_missed,
+                "skipped":               grand_skipped,
+                "match_rate_pct":        round(grand_matched / (grand_matched + grand_missed) * 100, 1)
+                                         if (grand_matched + grand_missed) > 0 else 0,
+                "sofa_events_unmatched": len(sofa_unmatched_rows),
+                "rapidapi_calls_this_run":   calls_this_run,
+                "rapidapi_calls_this_cycle": calls_after,
+                "rapidapi_cycle_start":      str(cycle_start.date()),
+            },
+            "matched":   [r for r in report_rows if r["status"] == "matched"],
+            "unmatched": [r for r in report_rows if r["status"] == "unmatched"],
+            "sofa_unmatched": sofa_unmatched_rows,
+            "skipped_countries": list(skipped_countries.keys()),
+        }
+        save_report(date, report_data)
+
+
+def parse_dates(date: str | None, dates: list[str] | None) -> list[str]:
+    """Normalize one or many date inputs into a validated YYYY-MM-DD list."""
+    raw_inputs = []
+    if date:
+        raw_inputs.append(date)
+    if dates:
+        raw_inputs.extend(dates)
+
+    normalized = []
+    for item in raw_inputs:
+        for token in item.split(","):
+            d = token.strip()
+            if not d:
+                continue
+            try:
+                datetime.strptime(d, "%Y-%m-%d")
+            except ValueError as exc:
+                raise ValueError(f"Invalid date '{d}'. Expected format: YYYY-MM-DD") from exc
+            normalized.append(d)
+
+    # Preserve user order while avoiding duplicate runs.
+    return list(dict.fromkeys(normalized))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Batch match DB games against Sofasport for a full date")
-    parser.add_argument("--date",           required=True,                    help="Date (YYYY-MM-DD)")
+    date_group = parser.add_mutually_exclusive_group(required=True)
+    date_group.add_argument("--date",                                          help="Single date (YYYY-MM-DD)")
+    date_group.add_argument("--dates", nargs="+",                             help="One or many dates; supports spaces or comma-separated values")
     parser.add_argument("--dry-run",        action="store_true",              help="Match but don't write sofa_event_id to DB")
     parser.add_argument("--unmatched-only", action="store_true",              help="Skip games that already have a sofa_event_id")
     parser.add_argument("--min-confidence", type=float, default=55,           help="Minimum confidence to accept a match (default: 55)")
     parser.add_argument("--min-games",       type=int,   default=1,            help="Minimum games a country must have to trigger an API call (default: 1)")
+    parser.add_argument("--report",          action="store_true",              help="Save a JSON match report to reports/<date>.json")
     args = parser.parse_args()
-    run(args.date, args.dry_run, args.unmatched_only, args.min_confidence, args.min_games)
+
+    dates_to_run = parse_dates(args.date, args.dates)
+    if not dates_to_run:
+        raise ValueError("No valid dates provided.")
+
+    for i, run_date in enumerate(dates_to_run, 1):
+        if len(dates_to_run) > 1:
+            print(f"\n[{i}/{len(dates_to_run)}] Processing {run_date}")
+        run(run_date, args.dry_run, args.unmatched_only, args.min_confidence, args.min_games, args.report)

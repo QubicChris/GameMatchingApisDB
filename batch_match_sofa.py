@@ -430,6 +430,22 @@ def fetch_sofa_statistics(sofa_event_id: int) -> list[dict]:
     return data.get("data", [])
 
 
+def fetch_sofa_incidents(sofa_event_id: int) -> list[dict]:
+    url = f"https://{RAPIDAPI_HOST}/v1/events/incidents"
+    params = urllib.parse.urlencode({"event_id": sofa_event_id})
+    req = urllib.request.Request(
+        f"{url}?{params}",
+        headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST},
+        method="GET"
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    log_api_call(f"events/incidents/{sofa_event_id}")
+
+    return data.get("data", [])
+
+
 SOFA_CALLS_DIR = Path("sofa_calls")
 
 
@@ -528,6 +544,115 @@ def store_statistics(game_id: int, sofa_event_id: int, raw_stats: list[dict], da
     )
     logger.info(f"      Saved statistics → {path}")
     return _flatten_stats(raw_stats)
+
+
+def _bool_to_int(v):
+    return None if v is None else int(bool(v))
+
+
+def _flatten_incidents(raw_incidents: list[dict]) -> list[dict]:
+    """Flatten raw /events/incidents JSON into rows matching the sofa_incidents columns."""
+    rows = []
+    for item in raw_incidents:
+        player     = item.get("player") or {}
+        manager    = item.get("manager") or {}
+        assist     = item.get("assist1") or {}
+        player_in  = item.get("playerIn") or {}
+        player_out = item.get("playerOut") or {}
+
+        rows.append({
+            "sofa_incident_id":     item.get("id"),
+            "incident_type":        item.get("incidentType"),
+            "incident_class":       item.get("incidentClass"),
+            "time":                 item.get("time"),
+            "added_time":           item.get("addedTime"),
+            "reversed_period_time": item.get("reversedPeriodTime"),
+            "is_home":              _bool_to_int(item.get("isHome")),
+            "home_score":           item.get("homeScore"),
+            "away_score":           item.get("awayScore"),
+            "player_id":            player.get("id"),
+            "player_name":          player.get("name"),
+            "assist_player_id":     assist.get("id"),
+            "assist_player_name":   assist.get("name"),
+            "player_in_id":         player_in.get("id"),
+            "player_in_name":       player_in.get("name"),
+            "player_out_id":        player_out.get("id"),
+            "player_out_name":      player_out.get("name"),
+            "reason":               item.get("reason"),
+            "rescinded":            _bool_to_int(item.get("rescinded")),
+            "confirmed":            _bool_to_int(item.get("confirmed")),
+            "injury":               _bool_to_int(item.get("injury")),
+            "manager_id":           manager.get("id"),
+            "manager_name":         manager.get("name"),
+            "text":                 item.get("text"),
+            "length":               item.get("length"),
+        })
+    return rows
+
+
+def store_incidents(game_id: int, sofa_event_id: int, raw_incidents: list[dict], date: str) -> int:
+    """Save raw JSON and upsert flattened incident rows. Returns rows written."""
+    path = save_json(
+        subdir=f"{date}/incidents",
+        filename=f"game_{game_id}_sofa_{sofa_event_id}.json",
+        data={"game_id": game_id, "sofa_event_id": sofa_event_id, "fetched_at": datetime.utcnow().isoformat(), "data": raw_incidents},
+    )
+    logger.info(f"      Saved incidents → {path}")
+
+    rows = _flatten_incidents(raw_incidents)
+    if not rows:
+        return 0
+
+    with engine.begin() as conn:
+        for row in rows:
+            row["game_id"] = game_id
+            row["sofa_event_id"] = sofa_event_id
+            conn.execute(text("""
+                INSERT INTO sofa_incidents (
+                    game_id, sofa_event_id, sofa_incident_id, incident_type, incident_class,
+                    time, added_time, reversed_period_time, is_home,
+                    home_score, away_score,
+                    player_id, player_name, assist_player_id, assist_player_name,
+                    player_in_id, player_in_name, player_out_id, player_out_name,
+                    reason, rescinded, confirmed, injury,
+                    manager_id, manager_name, text, length, fetched_at
+                ) VALUES (
+                    :game_id, :sofa_event_id, :sofa_incident_id, :incident_type, :incident_class,
+                    :time, :added_time, :reversed_period_time, :is_home,
+                    :home_score, :away_score,
+                    :player_id, :player_name, :assist_player_id, :assist_player_name,
+                    :player_in_id, :player_in_name, :player_out_id, :player_out_name,
+                    :reason, :rescinded, :confirmed, :injury,
+                    :manager_id, :manager_name, :text, :length, NOW()
+                )
+                ON DUPLICATE KEY UPDATE
+                    incident_class      = VALUES(incident_class),
+                    home_score          = VALUES(home_score),
+                    away_score          = VALUES(away_score),
+                    player_id           = VALUES(player_id),
+                    player_name         = VALUES(player_name),
+                    assist_player_id    = VALUES(assist_player_id),
+                    assist_player_name  = VALUES(assist_player_name),
+                    player_in_id        = VALUES(player_in_id),
+                    player_in_name      = VALUES(player_in_name),
+                    player_out_id       = VALUES(player_out_id),
+                    player_out_name     = VALUES(player_out_name),
+                    reason              = VALUES(reason),
+                    rescinded           = VALUES(rescinded),
+                    confirmed           = VALUES(confirmed),
+                    injury              = VALUES(injury),
+                    manager_id          = VALUES(manager_id),
+                    manager_name        = VALUES(manager_name),
+                    text                = VALUES(text),
+                    length              = VALUES(length),
+                    fetched_at          = NOW()
+            """), row)
+        conn.execute(
+            text("UPDATE sofa_games SET incidents_fetched_at = NOW() WHERE sofa_event_id = :sofa_event_id"),
+            {"sofa_event_id": sofa_event_id}
+        )
+
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -670,10 +795,10 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
         print()
         print(f"  Fetching odds + statistics for {len(all_to_write)} matched game(s)...")
         for i, (game_id, sofa_id, _sofa_event) in enumerate(all_to_write, 1):
-            if calls_used + 2 > MONTHLY_CALL_LIMIT:
+            if calls_used + 3 > MONTHLY_CALL_LIMIT:
                 skipped_odds_stats = len(all_to_write) - i + 1
                 print(f"  RapidAPI call limit reached ({calls_used}/{MONTHLY_CALL_LIMIT}) — stopping, "
-                      f"skipping odds/statistics for {skipped_odds_stats} remaining game(s).")
+                      f"skipping odds/statistics/incidents for {skipped_odds_stats} remaining game(s).")
                 break
 
             try:
@@ -687,8 +812,13 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
                 store_statistics(game_id, sofa_id, raw_stats, date)
                 time.sleep(API_CALL_DELAY)
 
+                raw_incidents = fetch_sofa_incidents(sofa_id)
+                calls_used += 1
+                n_incidents = store_incidents(game_id, sofa_id, raw_incidents, date)
+                time.sleep(API_CALL_DELAY)
+
                 n_stat_groups = sum(len(p.get("groups", [])) for p in raw_stats)
-                print(f"    [{i}/{len(all_to_write)}] game_id={game_id} sofa_id={sofa_id} — {len(raw_odds)} odds markets, {n_stat_groups} stat groups")
+                print(f"    [{i}/{len(all_to_write)}] game_id={game_id} sofa_id={sofa_id} — {len(raw_odds)} odds markets, {n_stat_groups} stat groups, {n_incidents} incidents")
             except Exception as e:
                 logger.error(f"    [FAILED] game_id={game_id} sofa_id={sofa_id} — {e}")
 

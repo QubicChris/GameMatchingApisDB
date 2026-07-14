@@ -17,6 +17,7 @@ class SofaGame(Base):
     score_away = Column(Integer)
     status = Column(String(100))
     fetched_at = Column(DateTime, default=datetime.utcnow)
+    incidents_fetched_at = Column(DateTime)
 
     game = relationship("Game", back_populates="sofa_game", uselist=False)
 
@@ -40,6 +41,7 @@ class Game(Base):
     company_games = relationship("CompanyGame", back_populates="game", cascade="all, delete-orphan")
     sofa_odds = relationship("SofaOdds", back_populates="game", cascade="all, delete-orphan")
     sofa_statistics = relationship("SofaStatistic", back_populates="game", cascade="all, delete-orphan")
+    sofa_incidents = relationship("SofaIncident", back_populates="game", cascade="all, delete-orphan")
 
 
 class CompanyGame(Base):
@@ -246,6 +248,54 @@ class SofaStatistic(Base):
     )
 
     game = relationship("Game", back_populates="sofa_statistics")
+
+
+class SofaIncident(Base):
+    __tablename__ = "sofa_incidents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    game_id = Column(Integer, ForeignKey("games.id"), nullable=False)
+    sofa_event_id = Column(Integer, nullable=False)
+    sofa_incident_id = Column(Integer)                # API's "id" — null for period/injuryTime
+
+    incident_type = Column(String(20))                # period | card | injuryTime | substitution | varDecision | goal
+    incident_class = Column(String(20))                # yellow/red, regular/injury, goalAwarded, regular/penalty/ownGoal...
+    time = Column(Integer)
+    added_time = Column(Integer)
+    reversed_period_time = Column(Integer)
+    is_home = Column(Integer)                          # nullable — period/injuryTime have none
+
+    home_score = Column(Integer)                       # goal + period only
+    away_score = Column(Integer)
+
+    player_id = Column(Integer)
+    player_name = Column(String(150))
+    assist_player_id = Column(Integer)
+    assist_player_name = Column(String(150))
+    player_in_id = Column(Integer)
+    player_in_name = Column(String(150))
+    player_out_id = Column(Integer)
+    player_out_name = Column(String(150))
+
+    reason = Column(String(100))                       # card reason
+    rescinded = Column(Integer)                         # card overturned
+    confirmed = Column(Integer)                         # varDecision
+    injury = Column(Integer)                            # substitution due to injury
+
+    manager_id = Column(Integer)
+    manager_name = Column(String(150))
+
+    text = Column(String(10))                           # period marker: "HT" / "FT"
+    length = Column(Integer)                             # injuryTime minutes added
+
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("sofa_event_id", "sofa_incident_id", name="uq_sofa_incident"),
+        UniqueConstraint("sofa_event_id", "incident_type", "time", "reversed_period_time", name="uq_sofa_incident_fallback"),
+    )
+
+    game = relationship("Game", back_populates="sofa_incidents")
 
 
 class TeamAlias(Base):

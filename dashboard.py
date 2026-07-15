@@ -453,7 +453,7 @@ if page == "🎮 Games":
 
     st.markdown("---")
 
-    tab_odds, tab_stats, tab_incidents = st.tabs(["📈 Odds Comparison", "📊 Statistics", "🚑 Incidents"])
+    tab_odds, tab_stats, tab_incidents = st.tabs(["📈 Odds Comparison", "📊 Statistics", "🕒 Incidents"])
 
     # ── Odds ──────────────────────────────────────────────────────────────────
     with tab_odds:
@@ -600,26 +600,28 @@ if page == "🎮 Games":
                     if t == "goal":
                         icon = {"penalty": "🥅⚽", "ownGoal": "🔴⚽"}.get(r.incident_class, "⚽")
                         label = {"penalty": "Penalty", "ownGoal": "Own Goal"}.get(r.incident_class, "Goal")
-                        detail = r.player_name or "—"
+                        detail = r.player_name if pd.notna(r.player_name) else "—"
                         if pd.notna(r.assist_player_name):
                             detail += f" (assist: {r.assist_player_name})"
                         return icon, label, detail
                     if t == "card":
                         icon = "🟥" if r.incident_class == "red" else "🟨"
-                        class_label = (r.incident_class or "").title()
-                        detail = r.player_name or "—"
+                        class_label = r.incident_class.title() if pd.notna(r.incident_class) else ""
+                        detail = r.player_name if pd.notna(r.player_name) else "—"
                         if pd.notna(r.reason):
                             detail += f" — {r.reason}"
                         if r.rescinded:
                             detail += " (rescinded)"
                         return icon, f"{class_label} Card".strip(), detail
                     if t == "substitution":
-                        detail = f"{r.player_out_name or '?'} ➜ {r.player_in_name or '?'}"
+                        out_name = r.player_out_name if pd.notna(r.player_out_name) else "?"
+                        in_name = r.player_in_name if pd.notna(r.player_in_name) else "?"
+                        detail = f"{out_name} ➜ {in_name}"
                         if r.injury:
                             detail += " (injury)"
                         return "🔄", "Substitution", detail
                     if t == "varDecision":
-                        return "📺", "VAR", r.incident_class or "—"
+                        return "📺", "VAR", r.incident_class if pd.notna(r.incident_class) else "—"
                     if t == "period":
                         return "⏱️", "Half Time" if r.text == "HT" else "Full Time", ""
                     if t == "injuryTime":

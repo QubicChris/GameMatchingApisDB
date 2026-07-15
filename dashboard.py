@@ -352,12 +352,11 @@ def load_market_types():
 def load_country_match_stats():
     sql = """
         SELECT
-            country,
+            COALESCE(country, 'Unknown') AS country,
             COUNT(*) AS total,
             SUM(CASE WHEN sofa_event_id IS NOT NULL THEN 1 ELSE 0 END) AS matched
         FROM games
-        WHERE country IS NOT NULL
-        GROUP BY country
+        GROUP BY COALESCE(country, 'Unknown')
         ORDER BY total DESC
     """
     with engine.connect() as conn:
@@ -368,13 +367,12 @@ def load_country_match_stats():
 def load_league_match_stats():
     sql = """
         SELECT
-            country,
-            league,
+            COALESCE(country, 'Unknown') AS country,
+            COALESCE(league, 'Unknown') AS league,
             COUNT(*) AS total,
             SUM(CASE WHEN sofa_event_id IS NOT NULL THEN 1 ELSE 0 END) AS matched
         FROM games
-        WHERE country IS NOT NULL AND league IS NOT NULL
-        GROUP BY country, league
+        GROUP BY COALESCE(country, 'Unknown'), COALESCE(league, 'Unknown')
         ORDER BY country, total DESC
     """
     with engine.connect() as conn:
@@ -839,7 +837,7 @@ elif page == "🌍 Match Rate by Country":
             "total":     st.column_config.NumberColumn("Total"),
             "matched":   st.column_config.NumberColumn("Matched"),
             "unmatched": st.column_config.NumberColumn("Unmatched"),
-            "pct":       st.column_config.ProgressColumn("Match %", min_value=0, max_value=1, format="%.0f%%"),
+            "pct":       st.column_config.TextColumn("Match %"),
         }
 
         for _, c in display.iterrows():
@@ -851,6 +849,7 @@ elif page == "🌍 Match Rate by Country":
                 sub["pct"] = sub["matched"] / sub["total"]
                 sub["unmatched"] = sub["total"] - sub["matched"]
                 sub = sub.sort_values("pct", ascending=False)
+                sub["pct"] = sub["pct"].apply(lambda p: f"{p:.0%}")
                 sub = sub[["league", "total", "matched", "unmatched", "pct"]]
                 st.dataframe(
                     sub,

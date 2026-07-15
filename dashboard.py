@@ -352,25 +352,29 @@ def load_market_types():
 def load_blown_leads(min_lead):
     sql = """
         WITH goals AS (
-            SELECT sofa_event_id, time, added_time,
+            SELECT sofa_event_id, time, added_time, home_score, away_score,
                    home_score - away_score AS diff
             FROM sofa_incidents
             WHERE incident_type = 'goal'
         ),
-        running AS (
-            SELECT sofa_event_id,
-                   MAX(diff) OVER (PARTITION BY sofa_event_id ORDER BY time, added_time
-                                    ROWS UNBOUNDED PRECEDING) AS running_max,
-                   MIN(diff) OVER (PARTITION BY sofa_event_id ORDER BY time, added_time
-                                    ROWS UNBOUNDED PRECEDING) AS running_min
-            FROM goals
-        ),
         agg AS (
             SELECT sofa_event_id,
-                   MAX(running_max) AS max_home_lead,
-                   MIN(running_min) AS max_away_lead
-            FROM running
+                   MAX(diff) AS max_home_lead,
+                   MIN(diff) AS max_away_lead
+            FROM goals
             GROUP BY sofa_event_id
+        ),
+        home_cross AS (
+            SELECT sofa_event_id, time, added_time, home_score, away_score,
+                   ROW_NUMBER() OVER (PARTITION BY sofa_event_id ORDER BY time, added_time) AS rn
+            FROM goals
+            WHERE diff >= :min_lead
+        ),
+        away_cross AS (
+            SELECT sofa_event_id, time, added_time, home_score, away_score,
+                   ROW_NUMBER() OVER (PARTITION BY sofa_event_id ORDER BY time, added_time) AS rn
+            FROM goals
+            WHERE diff <= -:min_lead
         )
         SELECT
             g.sofa_event_id,
@@ -378,14 +382,27 @@ def load_blown_leads(min_lead):
             COALESCE(gm.away_team, g.away_name) AS away_name,
             g.score_home, g.score_away,
             FROM_UNIXTIME(g.start_timestamp) AS match_date,
-            a.max_home_lead, a.max_away_lead,
             CASE
                 WHEN a.max_home_lead >= :min_lead AND g.score_home <= g.score_away THEN 'home_blew_lead'
                 WHEN a.max_away_lead <= -:min_lead AND g.score_away <= g.score_home THEN 'away_blew_lead'
-            END AS scenario
+            END AS scenario,
+            CASE
+                WHEN a.max_home_lead >= :min_lead AND g.score_home <= g.score_away THEN hc.home_score
+                ELSE ac.home_score
+            END AS lead_score_home,
+            CASE
+                WHEN a.max_home_lead >= :min_lead AND g.score_home <= g.score_away THEN hc.away_score
+                ELSE ac.away_score
+            END AS lead_score_away,
+            CASE
+                WHEN a.max_home_lead >= :min_lead AND g.score_home <= g.score_away THEN hc.time
+                ELSE ac.time
+            END AS lead_time
         FROM sofa_games g
         JOIN agg a ON a.sofa_event_id = g.sofa_event_id
         LEFT JOIN games gm ON gm.sofa_event_id = g.sofa_event_id
+        LEFT JOIN home_cross hc ON hc.sofa_event_id = g.sofa_event_id AND hc.rn = 1
+        LEFT JOIN away_cross ac ON ac.sofa_event_id = g.sofa_event_id AND ac.rn = 1
         WHERE (a.max_home_lead >= :min_lead AND g.score_home <= g.score_away)
            OR (a.max_away_lead <= -:min_lead AND g.score_away <= g.score_home)
         ORDER BY g.start_timestamp DESC
@@ -743,11 +760,16 @@ elif page == "📉 Blown Leads":
     else:
         display = df.copy()
         display["date"] = pd.to_datetime(display["match_date"]).dt.strftime("%Y-%m-%d %H:%M")
-        display["score"] = display.apply(lambda r: f"{int(r.score_home)}-{int(r.score_away)}", axis=1)
-        display = display[["date", "home_name", "away_name", "score", "max_home_lead", "max_away_lead", "scenario"]]
+        display["final_score"] = display.apply(lambda r: f"{int(r.score_home)}-{int(r.score_away)}", axis=1)
+        display["lead_snapshot"] = display.apply(
+            lambda r: f"{int(r.lead_score_home)}-{int(r.lead_score_away)} ({int(r.lead_time)}')"
+                      if pd.notna(r.lead_score_home) else "—",
+            axis=1
+        )
+        display = display[["date", "home_name", "away_name", "final_score", "lead_snapshot", "scenario"]]
         display = display.rename(columns={
             "home_name": "home", "away_name": "away",
-            "max_home_lead": "max home lead", "max_away_lead": "max away lead",
+            "final_score": "final score", "lead_snapshot": "lead snapshot",
         })
         st.caption(f"{len(display)} game(s) found")
         st.dataframe(display.style.hide(axis="index"), use_container_width=True, height=min(600, len(display) * 38 + 40))

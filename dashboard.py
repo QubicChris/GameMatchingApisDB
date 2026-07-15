@@ -302,6 +302,23 @@ def load_statistics(game_id, sofa_event_id):
     return None
 
 
+@st.cache_data(ttl=30)
+def load_incidents(game_id):
+    sql = """
+        SELECT
+            incident_type, incident_class, time, added_time, reversed_period_time,
+            is_home, home_score, away_score,
+            player_name, assist_player_name, player_in_name, player_out_name,
+            reason, rescinded, confirmed, injury,
+            manager_name, text, length
+        FROM sofa_incidents
+        WHERE game_id = :game_id
+        ORDER BY reversed_period_time DESC, time, added_time
+    """
+    with engine.connect() as conn:
+        return pd.read_sql(text(sql), conn, params={"game_id": game_id})
+
+
 @st.cache_data(ttl=60)
 def load_aliases(search=""):
     sql = """
@@ -431,7 +448,7 @@ if page == "🎮 Games":
 
     st.markdown("---")
 
-    tab_odds, tab_stats = st.tabs(["📈 Odds Comparison", "📊 Statistics"])
+    tab_odds, tab_stats, tab_incidents = st.tabs(["📈 Odds Comparison", "📊 Statistics", "🚑 Incidents"])
 
     # ── Odds ──────────────────────────────────────────────────────────────────
     with tab_odds:
@@ -545,6 +562,81 @@ if page == "🎮 Games":
                                 use_container_width=True,
                             )
                             st.markdown("")
+
+    # ── Incidents ─────────────────────────────────────────────────────────────
+    with tab_incidents:
+        if pd.isna(row.sofa_event_id):
+            st.warning("No Sofasport match — incidents unavailable.")
+        else:
+            try:
+                incidents = load_incidents(int(row.id))
+            except Exception as e:
+                st.error(f"Failed to load incidents: {e}")
+                incidents = pd.DataFrame()
+
+            if incidents.empty:
+                st.info("No incidents recorded for this game.")
+            else:
+                def minute(r):
+                    if pd.isna(r.time):
+                        return "—"
+                    m = f"{int(r.time)}'"
+                    if pd.notna(r.added_time) and r.added_time not in (0, 999):
+                        m += f"+{int(r.added_time)}"
+                    return m
+
+                def team(r):
+                    if pd.isna(r.is_home):
+                        return "—"
+                    return row.home_team if r.is_home else row.away_team
+
+                def event_detail(r):
+                    t = r.incident_type
+                    if t == "goal":
+                        icon = {"penalty": "🥅⚽", "ownGoal": "🔴⚽"}.get(r.incident_class, "⚽")
+                        label = {"penalty": "Penalty", "ownGoal": "Own Goal"}.get(r.incident_class, "Goal")
+                        detail = r.player_name or "—"
+                        if pd.notna(r.assist_player_name):
+                            detail += f" (assist: {r.assist_player_name})"
+                        return icon, label, detail
+                    if t == "card":
+                        icon = "🟥" if r.incident_class == "red" else "🟨"
+                        class_label = (r.incident_class or "").title()
+                        detail = r.player_name or "—"
+                        if pd.notna(r.reason):
+                            detail += f" — {r.reason}"
+                        if r.rescinded:
+                            detail += " (rescinded)"
+                        return icon, f"{class_label} Card".strip(), detail
+                    if t == "substitution":
+                        detail = f"{r.player_out_name or '?'} ➜ {r.player_in_name or '?'}"
+                        if r.injury:
+                            detail += " (injury)"
+                        return "🔄", "Substitution", detail
+                    if t == "varDecision":
+                        return "📺", "VAR", r.incident_class or "—"
+                    if t == "period":
+                        return "⏱️", "Half Time" if r.text == "HT" else "Full Time", ""
+                    if t == "injuryTime":
+                        return "➕", "Injury Time", f"{int(r.length)} min added" if pd.notna(r.length) else ""
+                    return "•", t, ""
+
+                table_rows = []
+                for _, r in incidents.iterrows():
+                    icon, label, detail = event_detail(r)
+                    table_rows.append({
+                        "Min": minute(r),
+                        "Event": f"{icon} {label}",
+                        "Team": team(r),
+                        "Detail": detail,
+                        "Score": f"{int(r.home_score)}-{int(r.away_score)}" if pd.notna(r.home_score) else "",
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(table_rows).style.hide(axis="index"),
+                    use_container_width=True,
+                    height=min(600, len(table_rows) * 38 + 40),
+                )
 
 
 # ── Team Aliases page ─────────────────────────────────────────────────────────

@@ -455,8 +455,6 @@ with st.sidebar:
         st.metric("Total Games",   summary["total"])
         st.metric("Sofa Matched",  f"{summary['matched']} / {summary['total']}", f"{pct}%")
         st.metric("Unmatched",     summary["unmatched"])
-        st.metric("Countries",     summary["countries"])
-        st.metric("Bookmakers",    summary["bookers"])
         st.caption(f"{summary['date_from']} → {summary['date_to']}")
     except Exception as e:
         st.error(f"DB connection error: {e}")

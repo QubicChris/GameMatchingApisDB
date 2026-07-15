@@ -348,6 +348,48 @@ def load_market_types():
         )
 
 
+@st.cache_data(ttl=60)
+def load_blown_leads(min_lead):
+    sql = """
+        WITH goals AS (
+            SELECT sofa_event_id, time, added_time,
+                   home_score - away_score AS diff
+            FROM sofa_incidents
+            WHERE incident_type = 'goal'
+        ),
+        running AS (
+            SELECT sofa_event_id,
+                   MAX(diff) OVER (PARTITION BY sofa_event_id ORDER BY time, added_time
+                                    ROWS UNBOUNDED PRECEDING) AS running_max,
+                   MIN(diff) OVER (PARTITION BY sofa_event_id ORDER BY time, added_time
+                                    ROWS UNBOUNDED PRECEDING) AS running_min
+            FROM goals
+        ),
+        agg AS (
+            SELECT sofa_event_id,
+                   MAX(running_max) AS max_home_lead,
+                   MIN(running_min) AS max_away_lead
+            FROM running
+            GROUP BY sofa_event_id
+        )
+        SELECT
+            g.sofa_event_id, g.home_name, g.away_name, g.score_home, g.score_away,
+            FROM_UNIXTIME(g.start_timestamp) AS match_date,
+            a.max_home_lead, a.max_away_lead,
+            CASE
+                WHEN a.max_home_lead >= :min_lead AND g.score_home <= g.score_away THEN 'home_blew_lead'
+                WHEN a.max_away_lead <= -:min_lead AND g.score_away <= g.score_home THEN 'away_blew_lead'
+            END AS scenario
+        FROM sofa_games g
+        JOIN agg a ON a.sofa_event_id = g.sofa_event_id
+        WHERE (a.max_home_lead >= :min_lead AND g.score_home <= g.score_away)
+           OR (a.max_away_lead <= -:min_lead AND g.score_away <= g.score_home)
+        ORDER BY g.start_timestamp DESC
+    """
+    with engine.connect() as conn:
+        return pd.read_sql(text(sql), conn, params={"min_lead": min_lead})
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -394,7 +436,7 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "View",
-        ["🎮 Games", "🔤 Team Aliases", "📋 Market Types"],
+        ["🎮 Games", "🔤 Team Aliases", "📋 Market Types", "📉 Blown Leads"],
         label_visibility="collapsed"
     )
 
@@ -452,6 +494,7 @@ if page == "🎮 Games":
     st.caption(f"📅 {kickoff_str} · {row.league} · {row.country}")
 
     st.markdown("---")
+
 
     tab_odds, tab_stats, tab_incidents = st.tabs(["📈 Odds Comparison", "📊 Statistics", "🕒 Incidents"])
 
@@ -675,3 +718,32 @@ elif page == "📋 Market Types":
         st.dataframe(df.style.hide(axis="index"), use_container_width=True, height=600)
     except Exception as e:
         st.error(f"Failed to load market types: {e}")
+
+
+# ── Blown Leads page ──────────────────────────────────────────────────────────
+
+elif page == "📉 Blown Leads":
+    st.markdown("### Blown Leads")
+    st.caption("Games where a team led by N+ goals at some point but didn't win")
+
+    min_lead = st.number_input("Minimum lead", min_value=1, max_value=5, value=2, step=1)
+
+    try:
+        df = load_blown_leads(int(min_lead))
+    except Exception as e:
+        st.error(f"Failed to load blown leads: {e}")
+        df = pd.DataFrame()
+
+    if df.empty:
+        st.info(f"No games found with a blown {min_lead}+ goal lead.")
+    else:
+        display = df.copy()
+        display["date"] = pd.to_datetime(display["match_date"]).dt.strftime("%Y-%m-%d %H:%M")
+        display["score"] = display.apply(lambda r: f"{int(r.score_home)}-{int(r.score_away)}", axis=1)
+        display = display[["date", "home_name", "away_name", "score", "max_home_lead", "max_away_lead", "scenario"]]
+        display = display.rename(columns={
+            "home_name": "home", "away_name": "away",
+            "max_home_lead": "max home lead", "max_away_lead": "max away lead",
+        })
+        st.caption(f"{len(display)} game(s) found")
+        st.dataframe(display.style.hide(axis="index"), use_container_width=True, height=min(600, len(display) * 38 + 40))

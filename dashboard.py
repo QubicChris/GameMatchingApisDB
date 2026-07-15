@@ -349,10 +349,44 @@ def load_market_types():
 
 
 @st.cache_data(ttl=60)
+def load_country_match_stats():
+    sql = """
+        SELECT
+            country,
+            COUNT(*) AS total,
+            SUM(CASE WHEN sofa_event_id IS NOT NULL THEN 1 ELSE 0 END) AS matched
+        FROM games
+        WHERE country IS NOT NULL
+        GROUP BY country
+        ORDER BY total DESC
+    """
+    with engine.connect() as conn:
+        return pd.read_sql(text(sql), conn)
+
+
+@st.cache_data(ttl=60)
+def load_league_match_stats():
+    sql = """
+        SELECT
+            country,
+            league,
+            COUNT(*) AS total,
+            SUM(CASE WHEN sofa_event_id IS NOT NULL THEN 1 ELSE 0 END) AS matched
+        FROM games
+        WHERE country IS NOT NULL AND league IS NOT NULL
+        GROUP BY country, league
+        ORDER BY country, total DESC
+    """
+    with engine.connect() as conn:
+        return pd.read_sql(text(sql), conn)
+
+
+@st.cache_data(ttl=60)
 def load_blown_leads(min_lead):
     sql = """
         WITH goals AS (
-            SELECT sofa_event_id, time, added_time, home_score, away_score,
+
+                    SELECT sofa_event_id, time, added_time, home_score, away_score,
                    home_score - away_score AS diff
             FROM sofa_incidents
             WHERE incident_type = 'goal'
@@ -457,7 +491,7 @@ with st.sidebar:
     st.markdown("---")
     page = st.radio(
         "View",
-        ["🎮 Games", "🔤 Team Aliases", "📋 Market Types", "📉 Blown Leads"],
+        ["🎮 Games", "🔤 Team Aliases", "📋 Market Types", "📉 Blown Leads", "🌍 Match Rate by Country"],
         label_visibility="collapsed"
     )
 
@@ -773,3 +807,55 @@ elif page == "📉 Blown Leads":
         })
         st.caption(f"{len(display)} game(s) found")
         st.dataframe(display.style.hide(axis="index"), use_container_width=True, height=min(600, len(display) * 38 + 40))
+
+
+# ── Match Rate by Country page ────────────────────────────────────────────────
+
+elif page == "🌍 Match Rate by Country":
+    st.markdown("### Match Rate by Country")
+    st.caption("Games matched to Sofasport, per country — expand a country to see its leagues")
+
+    try:
+        df = load_country_match_stats()
+        leagues_df = load_league_match_stats()
+    except Exception as e:
+        st.error(f"Failed to load country match stats: {e}")
+        df, leagues_df = pd.DataFrame(), pd.DataFrame()
+
+    if df.empty:
+        st.info("No games found.")
+    else:
+        display = df.copy()
+        display["pct"] = display["matched"] / display["total"]
+        display = display.sort_values("pct", ascending=False)
+
+        total_games   = int(display["total"].sum())
+        total_matched = int(display["matched"].sum())
+        overall_pct   = total_matched / total_games if total_games else 0
+        st.caption(f"{len(display)} countries · {total_matched}/{total_games} matched overall ({overall_pct:.0%})")
+
+        league_col_config = {
+            "league":    st.column_config.TextColumn("League"),
+            "total":     st.column_config.NumberColumn("Total"),
+            "matched":   st.column_config.NumberColumn("Matched"),
+            "unmatched": st.column_config.NumberColumn("Unmatched"),
+            "pct":       st.column_config.ProgressColumn("Match %", min_value=0, max_value=1, format="%.0f%%"),
+        }
+
+        for _, c in display.iterrows():
+            with st.expander(f"{c.country} — {int(c.matched)}/{int(c.total)} matched ({c.pct:.0%})"):
+                sub = leagues_df[leagues_df["country"] == c.country].copy()
+                if sub.empty:
+                    st.caption("No league data available.")
+                    continue
+                sub["pct"] = sub["matched"] / sub["total"]
+                sub["unmatched"] = sub["total"] - sub["matched"]
+                sub = sub.sort_values("pct", ascending=False)
+                sub = sub[["league", "total", "matched", "unmatched", "pct"]]
+                st.dataframe(
+                    sub,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(400, len(sub) * 38 + 40),
+                    column_config=league_col_config,
+                )

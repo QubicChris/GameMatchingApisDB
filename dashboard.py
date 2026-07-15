@@ -371,7 +371,9 @@ with st.sidebar:
 
     try:
         dates = load_dates()
-    except:
+    except Exception as e:
+        st.error(f"Failed to load available dates: {e}")
+        st.exception(e)
         dates = []
 
     from datetime import date, datetime
@@ -381,7 +383,9 @@ with st.sidebar:
 
     try:
         countries = ["All"] + load_countries()
-    except:
+    except Exception as e:
+        st.error(f"Failed to load countries: {e}")
+        st.exception(e)
         countries = ["All"]
 
     sel_country = st.selectbox("Country", countries)
@@ -409,6 +413,7 @@ if page == "🎮 Games":
         games = load_games(sel_date, sel_country, sofa_filter)
     except Exception as e:
         st.error(f"Failed to load games: {e}")
+        st.exception(e)
         st.stop()
 
     if games.empty:

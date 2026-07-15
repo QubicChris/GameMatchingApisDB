@@ -373,7 +373,10 @@ def load_blown_leads(min_lead):
             GROUP BY sofa_event_id
         )
         SELECT
-            g.sofa_event_id, g.home_name, g.away_name, g.score_home, g.score_away,
+            g.sofa_event_id,
+            COALESCE(gm.home_team, g.home_name) AS home_name,
+            COALESCE(gm.away_team, g.away_name) AS away_name,
+            g.score_home, g.score_away,
             FROM_UNIXTIME(g.start_timestamp) AS match_date,
             a.max_home_lead, a.max_away_lead,
             CASE
@@ -382,6 +385,7 @@ def load_blown_leads(min_lead):
             END AS scenario
         FROM sofa_games g
         JOIN agg a ON a.sofa_event_id = g.sofa_event_id
+        LEFT JOIN games gm ON gm.sofa_event_id = g.sofa_event_id
         WHERE (a.max_home_lead >= :min_lead AND g.score_home <= g.score_away)
            OR (a.max_away_lead <= -:min_lead AND g.score_away <= g.score_home)
         ORDER BY g.start_timestamp DESC

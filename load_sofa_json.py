@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -221,9 +222,13 @@ def write_incidents(conn, game_id: int, sofa_event_id: int, raw_incidents: list[
     if not rows:
         return 0
 
+    # Every VALUES entry must be a placeholder: pymysql's executemany regex backtracks for
+    # ~20-50s per call on a literal like CURRENT_TIMESTAMP before falling back to row-by-row.
+    fetched_at = datetime.utcnow()
     for row in rows:
         row["game_id"] = game_id
         row["sofa_event_id"] = sofa_event_id
+        row["fetched_at"] = fetched_at
 
     conn.execute(text("DELETE FROM sofa_incidents WHERE sofa_event_id = :sid"), {"sid": sofa_event_id})
     conn.execute(text("""
@@ -242,7 +247,7 @@ def write_incidents(conn, game_id: int, sofa_event_id: int, raw_incidents: list[
             :player_id, :player_name, :assist_player_id, :assist_player_name,
             :player_in_id, :player_in_name, :player_out_id, :player_out_name,
             :reason, :rescinded, :confirmed, :injury,
-            :manager_id, :manager_name, :text, :length, CURRENT_TIMESTAMP
+            :manager_id, :manager_name, :text, :length, :fetched_at
         )
     """), rows)
     return len(rows)

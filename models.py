@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
 
@@ -295,6 +295,16 @@ class SofaIncident(Base):
     )
 
     game = relationship("Game", back_populates="sofa_incidents")
+
+
+class SofaMatchDate(Base):
+    """Kickoff dates fully processed by auto_match_sofa.py, so the next run continues after them."""
+    __tablename__ = "sofa_match_dates"
+
+    match_date = Column(Date, primary_key=True)
+    matched = Column(Integer)
+    missed = Column(Integer)
+    completed_at = Column(DateTime, default=datetime.utcnow)
 
 
 class TeamAlias(Base):

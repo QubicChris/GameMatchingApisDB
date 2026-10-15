@@ -12,3 +12,4 @@ payload*
 *.json
 yo3.py
 dedup.py
+/logs

@@ -149,6 +149,15 @@ Flags:
 | `--min-confidence N` | Skip matches below this fuzzy score (default: 55) |
 | `--min-games N` | Skip countries with fewer than N games |
 
+### Automatic daily matching
+
+```powershell
+python auto_match_sofa.py --plan    # which dates would run and the max API calls; no requests made
+python auto_match_sofa.py           # run
+```
+
+Continues day by day after the last completed date (tracked in `sofa_match_dates`) until it catches up or the RapidAPI cycle limit (9,990 calls, resets on the 18th) is reached. It never processes today or the newest kickoff date in the DB, since those games may still be arriving. A date cut short by the limit is resumed on the next run. Meant to be scheduled once a day.
+
 ### Reload saved Sofasport data (no API calls)
 
 ```powershell

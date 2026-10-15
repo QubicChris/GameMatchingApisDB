@@ -185,6 +185,20 @@ def load_db_games(date: str, unmatched_only: bool) -> dict[str, list[dict]]:
     return by_country
 
 
+def load_games_missing_details(date: str) -> list[tuple[int, int]]:
+    """(game_id, sofa_event_id) for matched games on `date` whose odds/statistics/incidents were never fetched."""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT g.id, g.sofa_event_id
+            FROM games g
+            JOIN sofa_games sg ON sg.sofa_event_id = g.sofa_event_id
+            WHERE DATE(g.date_time_starts_utc) = :date
+              AND sg.incidents_fetched_at IS NULL
+            ORDER BY g.date_time_starts_utc
+        """), {"date": date}).fetchall()
+    return [(r.id, r.sofa_event_id) for r in rows]
+
+
 def write_sofa_ids(matches: list[tuple[int, int, dict]], dry_run: bool, all_db_games: list[dict]):
     """
     Write sofa_event_id to games table and upsert sofa_games row.
@@ -254,10 +268,11 @@ def fetch_sofa_events(country: str, date: str) -> list[dict]:
         headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST},
         method="GET"
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-
-    log_api_call(f"events/schedule/category/{country}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    finally:
+        log_api_call(f"events/schedule/category/{country}")  # failed requests count against the quota too
 
     return [
         {
@@ -408,10 +423,11 @@ def fetch_sofa_odds(sofa_event_id: int) -> list[dict]:
         headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST},
         method="GET"
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-
-    log_api_call(f"events/odds/{sofa_event_id}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    finally:
+        log_api_call(f"events/odds/{sofa_event_id}")  # failed requests count against the quota too
 
     return data.get("data", [])
 
@@ -424,10 +440,11 @@ def fetch_sofa_statistics(sofa_event_id: int) -> list[dict]:
         headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST},
         method="GET"
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-
-    log_api_call(f"events/statistics/{sofa_event_id}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    finally:
+        log_api_call(f"events/statistics/{sofa_event_id}")  # failed requests count against the quota too
 
     return data.get("data", [])
 
@@ -440,10 +457,11 @@ def fetch_sofa_incidents(sofa_event_id: int) -> list[dict]:
         headers={"x-rapidapi-key": RAPIDAPI_KEY, "x-rapidapi-host": RAPIDAPI_HOST},
         method="GET"
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-
-    log_api_call(f"events/incidents/{sofa_event_id}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    finally:
+        log_api_call(f"events/incidents/{sofa_event_id}")  # failed requests count against the quota too
 
     return data.get("data", [])
 
@@ -498,11 +516,11 @@ def store_incidents(game_id: int, sofa_event_id: int, raw_incidents: list[dict],
 
     with engine.begin() as conn:
         n_rows = write_incidents(conn, game_id, sofa_event_id, raw_incidents)
-        if n_rows:
-            conn.execute(
-                text("UPDATE sofa_games SET incidents_fetched_at = NOW() WHERE sofa_event_id = :sofa_event_id"),
-                {"sofa_event_id": sofa_event_id}
-            )
+        # Set even when there are no incidents: it marks the game's details as fetched.
+        conn.execute(
+            text("UPDATE sofa_games SET incidents_fetched_at = NOW() WHERE sofa_event_id = :sofa_event_id"),
+            {"sofa_event_id": sofa_event_id}
+        )
 
     return n_rows
 
@@ -511,7 +529,13 @@ def store_incidents(game_id: int, sofa_event_id: int, raw_incidents: list[dict],
 # Main
 # ---------------------------------------------------------------------------
 
-def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, min_games: int, report: bool = False):
+def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, min_games: int, report: bool = False,
+        fetch_missing_details: bool = False) -> dict:
+    """
+    Match one date. With fetch_missing_details, also fetch odds/statistics/incidents for games
+    matched earlier whose details were never fetched (e.g. a previous run hit the call limit).
+    Returns {"hit_limit": bool, "matched": int, "missed": int, "skipped": int}.
+    """
     if not RAPIDAPI_KEY:
         raise ValueError("RAPIDAPI_KEY not set in .env")
 
@@ -548,8 +572,9 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
 
     if calls_before >= MONTHLY_CALL_LIMIT:
         print(f"  ABORTING — RapidAPI call limit reached ({calls_before}/{MONTHLY_CALL_LIMIT} since {cycle_start.date()}). No requests made.")
-        return
+        return {"hit_limit": True, "matched": 0, "missed": 0, "skipped": total_games}
 
+    hit_limit = False
     grand_matched = grand_missed = grand_skipped = 0
     all_to_write  = []   # (game_id, sofa_id, sofa_event_dict)
     all_misses    = []   # (game, method, confidence)
@@ -563,13 +588,14 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
             print(f"  RapidAPI call limit reached ({calls_used}/{MONTHLY_CALL_LIMIT}) — stopping, "
                   f"skipping {len(not_run)} remaining countr{'y' if len(not_run) == 1 else 'ies'}.")
             grand_skipped += sum(len(g) for _, g in not_run)
+            hit_limit = True
             break
 
         print(f"  [{country}] {len(db_games)} game(s) — fetching...", end=" ", flush=True)
 
+        calls_used += 1
         try:
             sofa_events = fetch_sofa_events(country, date)
-            calls_used += 1
             print(f"{len(sofa_events)} sofa events")
         except Exception as e:
             print(f"API ERROR: {e}")
@@ -643,34 +669,43 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
         print(f"  {action} {len(all_to_write)} sofa_event_id(s) to DB")
 
     # ── Fetch odds + statistics per matched game ───────────────────────────────
-    if all_to_write and not dry_run:
+    to_fetch = [(game_id, sofa_id) for game_id, sofa_id, _ in all_to_write]
+    if fetch_missing_details and not dry_run and not hit_limit:
+        queued = {game_id for game_id, _ in to_fetch}
+        pending = [p for p in load_games_missing_details(date) if p[0] not in queued]
+        if pending:
+            print(f"  + {len(pending)} game(s) matched earlier whose odds/statistics/incidents were never fetched")
+        to_fetch += pending
+
+    if to_fetch and not dry_run:
         print()
-        print(f"  Fetching odds + statistics for {len(all_to_write)} matched game(s)...")
-        for i, (game_id, sofa_id, _sofa_event) in enumerate(all_to_write, 1):
+        print(f"  Fetching odds + statistics for {len(to_fetch)} matched game(s)...")
+        for i, (game_id, sofa_id) in enumerate(to_fetch, 1):
             if calls_used + 3 > MONTHLY_CALL_LIMIT:
-                skipped_odds_stats = len(all_to_write) - i + 1
+                skipped_odds_stats = len(to_fetch) - i + 1
                 print(f"  RapidAPI call limit reached ({calls_used}/{MONTHLY_CALL_LIMIT}) — stopping, "
                       f"skipping odds/statistics/incidents for {skipped_odds_stats} remaining game(s).")
+                hit_limit = True
                 break
 
             try:
-                raw_odds = fetch_sofa_odds(sofa_id)
                 calls_used += 1
+                raw_odds = fetch_sofa_odds(sofa_id)
                 store_odds(game_id, sofa_id, raw_odds, date)
                 time.sleep(API_CALL_DELAY)
 
-                raw_stats = fetch_sofa_statistics(sofa_id)
                 calls_used += 1
+                raw_stats = fetch_sofa_statistics(sofa_id)
                 store_statistics(game_id, sofa_id, raw_stats, date)
                 time.sleep(API_CALL_DELAY)
 
-                raw_incidents = fetch_sofa_incidents(sofa_id)
                 calls_used += 1
+                raw_incidents = fetch_sofa_incidents(sofa_id)
                 n_incidents = store_incidents(game_id, sofa_id, raw_incidents, date)
                 time.sleep(API_CALL_DELAY)
 
                 n_stat_groups = sum(len(p.get("groups", [])) for p in raw_stats)
-                print(f"    [{i}/{len(all_to_write)}] game_id={game_id} sofa_id={sofa_id} — {len(raw_odds)} odds markets, {n_stat_groups} stat groups, {n_incidents} incidents")
+                print(f"    [{i}/{len(to_fetch)}] game_id={game_id} sofa_id={sofa_id} — {len(raw_odds)} odds markets, {n_stat_groups} stat groups, {n_incidents} incidents")
             except Exception as e:
                 logger.error(f"    [FAILED] game_id={game_id} sofa_id={sofa_id} — {e}")
 
@@ -722,6 +757,8 @@ def run(date: str, dry_run: bool, unmatched_only: bool, min_confidence: float, m
             "skipped_countries": list(skipped_countries.keys()),
         }
         save_report(date, report_data)
+
+    return {"hit_limit": hit_limit, "matched": grand_matched, "missed": grand_missed, "skipped": grand_skipped}
 
 
 def parse_dates(date: str | None, dates: list[str] | None) -> list[str]:

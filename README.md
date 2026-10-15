@@ -154,7 +154,10 @@ Flags:
 ```powershell
 python load_sofa_json.py --date 2026-05-14
 python load_sofa_json.py --date 2026-05-14 --dry-run
+python load_sofa_json.py --all          # every date folder under sofa_calls/
 ```
+
+Loads statistics, odds and incidents. Each game's rows are replaced, so re-running is safe.
 
 ### Replay saved payload files
 

@@ -29,6 +29,8 @@ from dotenv import load_dotenv
 from rapidfuzz import fuzz
 from sqlalchemy import create_engine, text
 
+from load_sofa_json import write_incidents, write_odds, write_statistics
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
@@ -460,7 +462,7 @@ def save_json(subdir: str, filename: str, data: dict):
 
 
 def store_odds(game_id: int, sofa_event_id: int, raw_odds: list[dict], date: str):
-    """Save odds response as JSON under sofa_calls/<date>/odds/."""
+    """Save raw JSON under sofa_calls/<date>/odds/ and replace the game's sofa_odds rows."""
     path = save_json(
         subdir=f"{date}/odds",
         filename=f"game_{game_id}_sofa_{sofa_event_id}.json",
@@ -468,130 +470,25 @@ def store_odds(game_id: int, sofa_event_id: int, raw_odds: list[dict], date: str
     )
     logger.info(f"      Saved odds → {path}")
 
-
-# Mapping from Sofasport stat key to flat column names (home/away, and optional totals)
-STAT_COLUMN_MAP = {
-    "ballPossession":           ("ball_possession_home",       "ball_possession_away",       None, None),
-    "expectedGoals":            ("expected_goals_home",        "expected_goals_away",        None, None),
-    "totalShotsOnGoal":         ("total_shots_home",           "total_shots_away",           None, None),
-    "goalkeeperSaves":          ("goalkeeper_saves_home",      "goalkeeper_saves_away",      None, None),
-    "cornerKicks":              ("corner_kicks_home",          "corner_kicks_away",          None, None),
-    "fouls":                    ("fouls_home",                 "fouls_away",                 None, None),
-    "passes":                   ("passes_home",                "passes_away",                None, None),
-    "totalTackle":              ("tackles_home",               "tackles_away",               None, None),
-    "freeKicks":                ("free_kicks_home",            "free_kicks_away",            None, None),
-    "yellowCards":              ("yellow_cards_home",          "yellow_cards_away",          None, None),
-    "redCards":                 ("red_cards_home",             "red_cards_away",             None, None),
-    "shotsOnGoal":              ("shots_on_target_home",       "shots_on_target_away",       None, None),
-    "shotsOffGoal":             ("shots_off_target_home",      "shots_off_target_away",      None, None),
-    "blockedScoringAttempt":    ("blocked_shots_home",         "blocked_shots_away",         None, None),
-    "totalShotsInsideBox":      ("shots_inside_box_home",      "shots_inside_box_away",      None, None),
-    "totalShotsOutsideBox":     ("shots_outside_box_home",     "shots_outside_box_away",     None, None),
-    "hitWoodwork":              ("hit_woodwork_home",          "hit_woodwork_away",          None, None),
-    "accurateThroughBall":      ("through_balls_home",         "through_balls_away",         None, None),
-    "touchesInOppBox":          ("touches_in_opp_box_home",   "touches_in_opp_box_away",    None, None),
-    "offsides":                 ("offsides_home",              "offsides_away",              None, None),
-    "accuratePasses":           ("accurate_passes_home",       "accurate_passes_away",       None, None),
-    "throwIns":                 ("throw_ins_home",             "throw_ins_away",             None, None),
-    "accurateLongBalls":        ("long_balls_home",            "long_balls_away",            "long_balls_home_total",    "long_balls_away_total"),
-    "accurateCross":            ("crosses_home",               "crosses_away",               "crosses_home_total",       "crosses_away_total"),
-    "finalThirdPhaseStatistic": ("final_third_home",           "final_third_away",           "final_third_home_total",   "final_third_away_total"),
-    "duelWonPercent":           ("duel_won_pct_home",          "duel_won_pct_away",          None, None),
-    "dispossessed":             ("dispossessed_home",          "dispossessed_away",          None, None),
-    "groundDuelsPercentage":    ("ground_duels_home",          "ground_duels_away",          "ground_duels_home_total",  "ground_duels_away_total"),
-    "aerialDuelsPercentage":    ("aerial_duels_home",          "aerial_duels_away",          "aerial_duels_home_total",  "aerial_duels_away_total"),
-    "dribblesPercentage":       ("dribbles_home",              "dribbles_away",              "dribbles_home_total",      "dribbles_away_total"),
-    "interceptionWon":          ("interceptions_home",         "interceptions_away",         None, None),
-    "totalClearance":           ("clearances_home",            "clearances_away",            None, None),
-    "errorsLeadToShot":         ("errors_lead_to_shot_home",   "errors_lead_to_shot_away",   None, None),
-    "goalKicks":                ("goal_kicks_home",            "goal_kicks_away",            None, None),
-}
-
-
-def _flatten_stats(raw_stats: list[dict]) -> dict[str, dict]:
-    """
-    Returns {period: {col: value}} — one flat dict per period.
-    Deduplicates by (period, stat_key) — first occurrence wins.
-    """
-    by_period = {}
-    seen = set()
-    for period_block in raw_stats:
-        period = period_block.get("period", "ALL")
-        if period not in by_period:
-            by_period[period] = {}
-        for group in period_block.get("groups", []):
-            for item in group.get("statisticsItems", []):
-                key = item.get("key")
-                dedup_key = (period, key)
-                if dedup_key in seen or key not in STAT_COLUMN_MAP:
-                    continue
-                seen.add(dedup_key)
-                h_col, a_col, ht_col, at_col = STAT_COLUMN_MAP[key]
-                by_period[period][h_col] = item.get("homeValue")
-                by_period[period][a_col] = item.get("awayValue")
-                if ht_col:
-                    by_period[period][ht_col] = item.get("homeTotal")
-                    by_period[period][at_col] = item.get("awayTotal")
-    return by_period
+    with engine.begin() as conn:
+        write_odds(conn, game_id, sofa_event_id, raw_odds)
 
 
 def store_statistics(game_id: int, sofa_event_id: int, raw_stats: list[dict], date: str):
-    """Save raw JSON and return flattened stats per period."""
+    """Save raw JSON under sofa_calls/<date>/statistics/ and replace the game's sofa_statistics rows."""
     path = save_json(
         subdir=f"{date}/statistics",
         filename=f"game_{game_id}_sofa_{sofa_event_id}.json",
         data={"game_id": game_id, "sofa_event_id": sofa_event_id, "fetched_at": datetime.utcnow().isoformat(), "data": raw_stats},
     )
     logger.info(f"      Saved statistics → {path}")
-    return _flatten_stats(raw_stats)
 
-
-def _bool_to_int(v):
-    return None if v is None else int(bool(v))
-
-
-def _flatten_incidents(raw_incidents: list[dict]) -> list[dict]:
-    """Flatten raw /events/incidents JSON into rows matching the sofa_incidents columns."""
-    rows = []
-    for item in raw_incidents:
-        player     = item.get("player") or {}
-        manager    = item.get("manager") or {}
-        assist     = item.get("assist1") or {}
-        player_in  = item.get("playerIn") or {}
-        player_out = item.get("playerOut") or {}
-
-        rows.append({
-            "sofa_incident_id":     item.get("id"),
-            "incident_type":        item.get("incidentType"),
-            "incident_class":       item.get("incidentClass"),
-            "time":                 item.get("time"),
-            "added_time":           item.get("addedTime"),
-            "reversed_period_time": item.get("reversedPeriodTime"),
-            "is_home":              _bool_to_int(item.get("isHome")),
-            "home_score":           item.get("homeScore"),
-            "away_score":           item.get("awayScore"),
-            "player_id":            player.get("id"),
-            "player_name":          player.get("name"),
-            "assist_player_id":     assist.get("id"),
-            "assist_player_name":   assist.get("name"),
-            "player_in_id":         player_in.get("id"),
-            "player_in_name":       player_in.get("name"),
-            "player_out_id":        player_out.get("id"),
-            "player_out_name":      player_out.get("name"),
-            "reason":               item.get("reason"),
-            "rescinded":            _bool_to_int(item.get("rescinded")),
-            "confirmed":            _bool_to_int(item.get("confirmed")),
-            "injury":               _bool_to_int(item.get("injury")),
-            "manager_id":           manager.get("id"),
-            "manager_name":         manager.get("name"),
-            "text":                 item.get("text"),
-            "length":               item.get("length"),
-        })
-    return rows
+    with engine.begin() as conn:
+        write_statistics(conn, game_id, sofa_event_id, raw_stats)
 
 
 def store_incidents(game_id: int, sofa_event_id: int, raw_incidents: list[dict], date: str) -> int:
-    """Save raw JSON and upsert flattened incident rows. Returns rows written."""
+    """Save raw JSON and replace the event's sofa_incidents rows. Returns rows written."""
     path = save_json(
         subdir=f"{date}/incidents",
         filename=f"game_{game_id}_sofa_{sofa_event_id}.json",
@@ -599,60 +496,15 @@ def store_incidents(game_id: int, sofa_event_id: int, raw_incidents: list[dict],
     )
     logger.info(f"      Saved incidents → {path}")
 
-    rows = _flatten_incidents(raw_incidents)
-    if not rows:
-        return 0
-
     with engine.begin() as conn:
-        for row in rows:
-            row["game_id"] = game_id
-            row["sofa_event_id"] = sofa_event_id
-            conn.execute(text("""
-                INSERT INTO sofa_incidents (
-                    game_id, sofa_event_id, sofa_incident_id, incident_type, incident_class,
-                    time, added_time, reversed_period_time, is_home,
-                    home_score, away_score,
-                    player_id, player_name, assist_player_id, assist_player_name,
-                    player_in_id, player_in_name, player_out_id, player_out_name,
-                    reason, rescinded, confirmed, injury,
-                    manager_id, manager_name, text, length, fetched_at
-                ) VALUES (
-                    :game_id, :sofa_event_id, :sofa_incident_id, :incident_type, :incident_class,
-                    :time, :added_time, :reversed_period_time, :is_home,
-                    :home_score, :away_score,
-                    :player_id, :player_name, :assist_player_id, :assist_player_name,
-                    :player_in_id, :player_in_name, :player_out_id, :player_out_name,
-                    :reason, :rescinded, :confirmed, :injury,
-                    :manager_id, :manager_name, :text, :length, NOW()
-                )
-                ON DUPLICATE KEY UPDATE
-                    incident_class      = VALUES(incident_class),
-                    home_score          = VALUES(home_score),
-                    away_score          = VALUES(away_score),
-                    player_id           = VALUES(player_id),
-                    player_name         = VALUES(player_name),
-                    assist_player_id    = VALUES(assist_player_id),
-                    assist_player_name  = VALUES(assist_player_name),
-                    player_in_id        = VALUES(player_in_id),
-                    player_in_name      = VALUES(player_in_name),
-                    player_out_id       = VALUES(player_out_id),
-                    player_out_name     = VALUES(player_out_name),
-                    reason              = VALUES(reason),
-                    rescinded           = VALUES(rescinded),
-                    confirmed           = VALUES(confirmed),
-                    injury              = VALUES(injury),
-                    manager_id          = VALUES(manager_id),
-                    manager_name        = VALUES(manager_name),
-                    text                = VALUES(text),
-                    length              = VALUES(length),
-                    fetched_at          = NOW()
-            """), row)
-        conn.execute(
-            text("UPDATE sofa_games SET incidents_fetched_at = NOW() WHERE sofa_event_id = :sofa_event_id"),
-            {"sofa_event_id": sofa_event_id}
-        )
+        n_rows = write_incidents(conn, game_id, sofa_event_id, raw_incidents)
+        if n_rows:
+            conn.execute(
+                text("UPDATE sofa_games SET incidents_fetched_at = NOW() WHERE sofa_event_id = :sofa_event_id"),
+                {"sofa_event_id": sofa_event_id}
+            )
 
-    return len(rows)
+    return n_rows
 
 
 # ---------------------------------------------------------------------------

@@ -292,7 +292,6 @@ class SofaIncident(Base):
 
     __table_args__ = (
         UniqueConstraint("sofa_event_id", "sofa_incident_id", name="uq_sofa_incident"),
-        UniqueConstraint("sofa_event_id", "incident_type", "time", "reversed_period_time", name="uq_sofa_incident_fallback"),
     )
 
     game = relationship("Game", back_populates="sofa_incidents")

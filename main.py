@@ -294,46 +294,52 @@ async def ingest_snapshot(request: Request, db: Session = Depends(get_db)):
 
     for game_payload in payload:
         label = f"{game_payload.HomeTeam} vs {game_payload.AwayTeam} ({game_payload.League})"
+        updated_companies = []
         try:
-            existing_game = _get_existing_game(db, game_payload)
+            # Savepoint per game: a failure only undoes this game, not the rest of the batch.
+            with db.begin_nested():
+                existing_game = _get_existing_game(db, game_payload)
 
-            if existing_game:
-                game_ids.append(existing_game.id)
-                for cg_in in game_payload.ListCompanyGames:
-                    _, was_updated = _upsert_company_game(
-                        db, existing_game, cg_in,
-                        game_payload.HomeTeam, game_payload.AwayTeam
+                if existing_game:
+                    game = existing_game
+                    for cg_in in game_payload.ListCompanyGames:
+                        _, was_updated = _upsert_company_game(
+                            db, existing_game, cg_in,
+                            game_payload.HomeTeam, game_payload.AwayTeam
+                        )
+                        if was_updated:
+                            updated_companies.append(cg_in.CompanyName)
+                else:
+                    game = Game(
+                        date_time_starts_utc=game_payload.DateTimeStartsUTC,
+                        home_team=game_payload.HomeTeam,
+                        away_team=game_payload.AwayTeam,
+                        league=game_payload.League,
+                        country=game_payload.Country,
+                        univ_home_id=game_payload.Univ_HomeId,
+                        univ_away_id=game_payload.Univ_AwayId,
+                        univ_league_id=game_payload.Univ_LeagueId,
                     )
-                    if was_updated:
-                        updated += 1
-                        logger.info(f"  [UPDATE] {cg_in.CompanyName} | game id={existing_game.id} | {label}")
-            else:
-                game = Game(
-                    date_time_starts_utc=game_payload.DateTimeStartsUTC,
-                    home_team=game_payload.HomeTeam,
-                    away_team=game_payload.AwayTeam,
-                    league=game_payload.League,
-                    country=game_payload.Country,
-                    univ_home_id=game_payload.Univ_HomeId,
-                    univ_away_id=game_payload.Univ_AwayId,
-                    univ_league_id=game_payload.Univ_LeagueId,
-                )
-                db.add(game)
-                db.flush()
+                    db.add(game)
+                    db.flush()
 
-                bookmakers = []
-                for cg_in in game_payload.ListCompanyGames:
-                    _upsert_company_game(db, game, cg_in, game_payload.HomeTeam, game_payload.AwayTeam)
-                    bookmakers.append(cg_in.CompanyName)
-
-                game_ids.append(game.id)
-                inserted += 1
-                logger.info(f"  [INSERT] game id={game.id} | {label} | bookmakers={bookmakers}")
+                    for cg_in in game_payload.ListCompanyGames:
+                        _upsert_company_game(db, game, cg_in, game_payload.HomeTeam, game_payload.AwayTeam)
 
         except Exception as e:
             logger.error(f"  [FAILED] {label} | error={e}")
             failed.append(label)
-            db.rollback()
+            continue
+
+        game_ids.append(game.id)
+        if existing_game:
+            updated += len(updated_companies)
+            for company in updated_companies:
+                logger.info(f"  [UPDATE] {company} | game id={game.id} | {label}")
+        else:
+            inserted += 1
+            bookmakers = [cg_in.CompanyName for cg_in in game_payload.ListCompanyGames]
+            logger.info(f"  [INSERT] game id={game.id} | {label} | bookmakers={bookmakers}")
 
     db.commit()
 

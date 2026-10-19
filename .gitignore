@@ -15,3 +15,10 @@ dedup.py
 /logs
 __pycache__/
 /exports
+
+# React app (web/)
+/web/node_modules
+/web/dist
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.json

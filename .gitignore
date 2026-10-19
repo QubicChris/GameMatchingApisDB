@@ -13,3 +13,5 @@ payload*
 yo3.py
 dedup.py
 /logs
+__pycache__/
+/exports

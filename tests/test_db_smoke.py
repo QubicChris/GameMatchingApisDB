@@ -40,3 +40,18 @@ def test_api_quota():
     quota = q.load_api_quota()
     assert isinstance(quota, dict)
     assert quota["api_calls_used"] is None or isinstance(quota["api_calls_used"], int)
+
+
+def test_export_preview_and_build(tmp_path):
+    import openpyxl
+
+    import excel_export
+    from webapi import queries as q
+
+    d = q.load_filters()["dates"][0]
+    p = excel_export.preview(d, d)
+    assert p["ok"] is True
+    out = tmp_path / "x.xlsx"
+    excel_export.build_workbook(out, d, d)
+    assert out.exists()
+    assert "Games" in openpyxl.load_workbook(out).sheetnames

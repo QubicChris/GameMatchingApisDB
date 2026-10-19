@@ -2,9 +2,14 @@
 Authenticated JSON endpoints for the dashboard (all under /api, login required).
 """
 import logging
+import os
+import tempfile
 from typing import Literal
 
+import excel_export
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 
 from webapi import queries
 from webapi.auth import current_user
@@ -116,3 +121,36 @@ def blown_leads(min_lead: int = Query(2, ge=1, le=5)):
 @router.get("/match-rates")
 def match_rates():
     return queries.load_match_rates()
+
+
+DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
+
+
+@router.get("/export/preview")
+def export_preview(date_from: str = Query(..., pattern=DATE_RE), date_to: str = Query(..., pattern=DATE_RE),
+                   include_odds: bool = True):
+    try:
+        return excel_export.preview(date_from, date_to, include_odds)
+    except excel_export.ExportRangeError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.get("/export.xlsx")
+def export_xlsx(date_from: str = Query(..., pattern=DATE_RE), date_to: str = Query(..., pattern=DATE_RE),
+                include_odds: bool = True):
+    fd, tmp = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    try:
+        excel_export.build_workbook(tmp, date_from, date_to, include_odds)
+    except excel_export.ExportRangeError as e:
+        os.unlink(tmp)
+        raise HTTPException(400, str(e))
+    except excel_export.ExportTooLarge as e:
+        os.unlink(tmp)
+        raise HTTPException(413, str(e))
+    except Exception:
+        os.unlink(tmp)
+        raise
+    return FileResponse(tmp, filename=excel_export.default_filename(date_from, date_to, include_odds),
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        background=BackgroundTask(os.unlink, tmp))

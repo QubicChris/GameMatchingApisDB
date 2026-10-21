@@ -107,44 +107,63 @@ def _won_lost(v):
     return "Won" if v else "Lost"
 
 
-def pivot_odds_rows(rows: list[dict]) -> tuple[list[str], list[dict]]:
-    """Pivot long odds rows to one wide row per (game, market, outcome, line).
+def _max(a, b):
+    return b if a is None else a if b is None else max(a, b)
 
-    Done with a dict (not pandas.pivot_table) so rows with NULL line_value survive.
+
+def pivot_odds_rows(rows) -> tuple[list[str], list[dict]]:
+    """Group raw odds rows into one wide row per (game, market, outcome, line).
+
+    Grouping happens here, not in MySQL: a GROUP BY over a week of selections spills
+    MySQL's temp table to disk, where some MySQL 8 builds raise a false
+    "1062 Duplicate entry ... for key <group_key>". Dict-based (not pandas) so NULL
+    line_value rows survive. Repeated (key, bookmaker) rows keep the max, like SQL MAX().
     """
-    bookmakers = sorted({r["company_name"] for r in rows})
+    books: set[str] = set()
     wide: dict = {}
     for r in rows:
         key = (r["game_id"], r["umid"], r["outcome"], r["line_value"])
         w = wide.get(key)
         if w is None:
-            w = {
+            w = wide[key] = {
                 "game_id": r["game_id"], "kickoff": r["kickoff"], "match_name": r["match_name"],
                 "league": r["league"], "umid": r["umid"],
                 "market": r["market"] or f"Market {r['umid']}",
                 "outcome": r["outcome"], "line_value": r["line_value"],
-                "sofa_close": None, "sofa_result": None,
+                "_odds": {}, "sofa_close": None, "_win": None,
             }
-            for b in bookmakers:
-                w[f"odds_{b}"] = None
-            wide[key] = w
-        w[f"odds_{r['company_name']}"] = r["odd"]
-        if r.get("sofa_close") is not None:
-            w["sofa_close"] = r["sofa_close"]
-        if r.get("sofa_winning") is not None:
-            w["sofa_result"] = _won_lost(r["sofa_winning"])
+        b = r["company_name"]
+        books.add(b)
+        w["_odds"][b] = _max(w["_odds"].get(b), r["odd"])
+        w["sofa_close"] = _max(w["sofa_close"], r.get("sofa_close"))
+        w["_win"] = _max(w["_win"], r.get("sofa_winning"))
+    bookmakers = sorted(books)
     out = []
     for w in wide.values():
-        vals = {b: w[f"odds_{b}"] for b in bookmakers if w[f"odds_{b}"] is not None}
+        odds = w.pop("_odds")
+        w["sofa_result"] = _won_lost(w.pop("_win"))
+        for b in bookmakers:
+            w[f"odds_{b}"] = odds.get(b)
+        vals = {b: v for b, v in odds.items() if v is not None}
         if vals:
             best = max(vals.values())
             w["best_odds"] = best
-            w["best_bookmaker"] = ", ".join(b for b, v in vals.items() if v == best)
+            w["best_bookmaker"] = ", ".join(b for b in bookmakers if vals.get(b) == best)
         else:
             w["best_odds"] = None
             w["best_bookmaker"] = None
         out.append(w)
     return bookmakers, out
+
+
+def count_odds_keys(keys, cap: int) -> int:
+    """Number of distinct (game, market, outcome, line) keys; stops counting once it exceeds `cap`."""
+    seen = set()
+    for k in keys:
+        seen.add(tuple(k))
+        if len(seen) > cap:
+            break
+    return len(seen)
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -251,13 +270,13 @@ WHERE {RANGE}
 ORDER BY g.date_time_starts_utc, g.id, cg.company_name
 """
 
-# Keep identical to webapi/queries.py _ODDS_SQL. Never GROUP/ORDER BY the bare
-# alias `outcome` (sofa_odds has a column of that name -> error 1055).
+# Raw (ungrouped) rows: grouping is done in Python by pivot_odds_rows (see its docstring).
+# Never GROUP/ORDER BY the bare alias `outcome` (sofa_odds has a column of that name -> error 1055).
 _ODDS_SQL = f"""
 SELECT g.id AS game_id, g.date_time_starts_utc AS kickoff, {MATCH} AS match_name, g.league,
        pm.umid, mt.canonical_name AS market,
        COALESCE(s.canonical_outcome, s.raw_outcome) AS outcome, s.line_value,
-       cg.company_name, MAX(s.odd) AS odd, MAX(so.odd) AS sofa_close, MAX(so.winning) AS sofa_winning
+       cg.company_name, s.odd AS odd, so.odd AS sofa_close, so.winning AS sofa_winning
 FROM games g
 JOIN company_games cg ON cg.game_id = g.id
 JOIN pregame_markets pm ON pm.company_game_id = cg.id
@@ -280,16 +299,14 @@ LEFT JOIN sofa_odds so ON so.game_id = g.id
     AND (so.choice_group COLLATE utf8mb4_unicode_ci = CAST(s.line_value AS CHAR)
          OR (so.choice_group IS NULL AND s.line_value IS NULL))
 WHERE {RANGE}
-GROUP BY g.id, g.date_time_starts_utc, g.home_team, g.away_team, g.league, pm.umid, mt.canonical_name,
-         COALESCE(s.canonical_outcome, s.raw_outcome), s.line_value, cg.company_name
-ORDER BY g.date_time_starts_utc, g.id, pm.umid, s.line_value, COALESCE(s.canonical_outcome, s.raw_outcome), cg.company_name
+ORDER BY g.date_time_starts_utc, g.id, pm.umid, s.line_value, s.id
 """
 
-_ODDS_COUNT_SQL = f"""
-SELECT COUNT(*) FROM (SELECT 1 FROM games g JOIN company_games cg ON cg.game_id = g.id
+_ODDS_KEYS_SQL = f"""
+SELECT g.id, pm.umid, COALESCE(s.canonical_outcome, s.raw_outcome), s.line_value
+FROM games g JOIN company_games cg ON cg.game_id = g.id
 JOIN pregame_markets pm ON pm.company_game_id = cg.id JOIN selections s ON s.market_id = pm.id
 WHERE {RANGE}
-GROUP BY g.id, pm.umid, COALESCE(s.canonical_outcome, s.raw_outcome), s.line_value) t
 """
 
 _LADDER_SQL = f"""
@@ -374,7 +391,7 @@ SHEETS: list[SheetSpec] = [
         Col("date_pregame_data_updated", "Pregame Data Updated (UTC)", "datetime"),
         Col("date_live_data_updated", "Live Data Updated (UTC)", "datetime"),
     )),
-    SheetSpec("Odds", _ODDS_SQL, _ODDS_COUNT_SQL, (), odds=True),
+    SheetSpec("Odds", _ODDS_SQL, "", (), odds=True),
     SheetSpec("Exchange Ladder", _LADDER_SQL, _count(_LADDER_SQL), (
         Col("game_id", "Game ID", "int"), Col("kickoff", "Kickoff (UTC)", "datetime"),
         Col("match_name", "Match"), Col("company_name", "Bookmaker"),
@@ -443,15 +460,26 @@ def _params(spec: SheetSpec, start, end) -> dict:
 def count_rows(conn, specs, start, end) -> dict:
     out = {}
     for spec in specs:
+        if spec.name == "Odds":
+            stmt = text(_ODDS_KEYS_SQL).execution_options(stream_results=True)
+            result = conn.execute(stmt, _params(spec, start, end))
+            try:
+                out[spec.name] = count_odds_keys(result, MAX_SHEET_ROWS)
+            finally:
+                result.close()
+            continue
         out[spec.name] = int(conn.execute(text(spec.count_sql), _params(spec, start, end)).scalar() or 0)
     return out
 
 
 def fetch_sheet(conn, spec: SheetSpec, start, end):
-    result = conn.execute(text(spec.sql), _params(spec, start, end))
-    rows = [{k: _clean(v) for k, v in m.items()} for m in result.mappings()]
     if spec.name == "Odds":
-        bookmakers, wide = pivot_odds_rows(rows)
+        stmt = text(spec.sql).execution_options(stream_results=True)
+        result = conn.execute(stmt, _params(spec, start, end))
+        try:
+            bookmakers, wide = pivot_odds_rows({k: _clean(v) for k, v in m.items()} for m in result.mappings())
+        finally:
+            result.close()
         cols = [
             Col("game_id", "Game ID", "int"), Col("kickoff", "Kickoff (UTC)", "datetime"),
             Col("match_name", "Match"), Col("league", "League"), Col("umid", "Market ID", "int"),
@@ -461,6 +489,8 @@ def fetch_sheet(conn, spec: SheetSpec, start, end):
             Col("sofa_close", "Sofa Closing Odds", "odds"), Col("sofa_result", "Sofa Result"),
         ]
         return cols, wide
+    result = conn.execute(text(spec.sql), _params(spec, start, end))
+    rows = [{k: _clean(v) for k, v in m.items()} for m in result.mappings()]
     if spec.transform:
         rows = [spec.transform(r) for r in rows]
     return list(spec.columns), rows

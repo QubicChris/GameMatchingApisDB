@@ -55,3 +55,10 @@ def test_export_preview_and_build(tmp_path):
     excel_export.build_workbook(out, d, d)
     assert out.exists()
     assert "Games" in openpyxl.load_workbook(out).sheetnames
+    ws = openpyxl.load_workbook(out)["Odds"]
+    odds_rows = next(s["rows"] for s in p["sheets"] if s["name"] == "Odds")
+    written = 0 if ws["A2"].value == "No rows for this date range." else ws.max_row - 1
+    assert written == odds_rows
+    if odds_rows > 0:
+        headers = [c.value for c in ws[1]]
+        assert any(h.endswith(" Odds") and h not in ("Best Odds", "Sofa Closing Odds") for h in headers if h)

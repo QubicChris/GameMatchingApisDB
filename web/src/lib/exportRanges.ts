@@ -13,8 +13,24 @@ export function presetRange(preset: RangePreset, dates: string[]): [string, stri
   return [dayjs(newest).subtract(back, 'day').format(FMT), newest];
 }
 
-export function cliCommand(from: string, to: string, includeOdds: boolean): string {
-  return `python export_excel.py --from ${from} --to ${to}${includeOdds ? '' : ' --no-odds'}`;
+export const EXPORT_SHEETS = [
+  'Games', 'Bookmaker Games', 'Odds', 'Exchange Ladder', 'Sofa Odds', 'Match Stats', 'Incidents',
+  'Match Rates', 'Team Aliases', 'Market Types',
+] as const;
+export const ODDS_SHEETS: string[] = ['Odds', 'Exchange Ladder', 'Sofa Odds'];
+
+export interface CliOptions { countries?: string[]; leagues?: string[]; umids?: number[]; sheets?: string[] }
+
+const quote = (v: string) => `"${v.replace(/"/g, '\\"')}"`;
+
+export function cliCommand(from: string, to: string, opts: CliOptions = {}): string {
+  const parts = ['python export_excel.py', `--from ${from}`, `--to ${to}`];
+  for (const c of opts.countries ?? []) parts.push(`--country ${quote(c)}`);
+  for (const l of opts.leagues ?? []) parts.push(`--league ${quote(l)}`);
+  for (const m of opts.umids ?? []) parts.push(`--market ${m}`);
+  const sheets = opts.sheets ?? [];
+  if (sheets.length > 0 && sheets.length < EXPORT_SHEETS.length) parts.push(`--sheets ${quote(sheets.join(','))}`);
+  return parts.join(' ');
 }
 
 export function rangeDays(from: string, to: string): number {

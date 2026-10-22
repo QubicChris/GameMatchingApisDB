@@ -48,7 +48,10 @@ export interface CountryRate { country: string; total: number; matched: number }
 export interface LeagueRate { country: string; league: string; total: number; matched: number }
 export interface MatchRates { countries: CountryRate[]; leagues: LeagueRate[] }
 
-export interface ExportParams { date_from: string; date_to: string; include_odds: boolean }
+export interface ExportParams {
+  date_from: string; date_to: string; include_odds: boolean;
+  countries?: string[]; leagues?: string[]; umids?: number[]; sheets?: string[];
+}
 export interface ExportPreview {
   date_from: string; date_to: string; include_odds: boolean; max_rows: number;
   sheets: { name: string; rows: number }[]; too_large: string[]; ok: boolean;

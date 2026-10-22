@@ -58,11 +58,11 @@ def test_parse_range():
 
 
 def _stub(monkeypatch, games_rows):
-    def fetch(conn, spec, start, end):
+    def fetch(conn, spec, start, end, filters=None, cap=None):
         cols = list(spec.columns) or [Col("game_id", "Game ID", "int"), Col("odds_X", "X Odds", "odds")]
         return cols, (games_rows if spec.name == "Games" else [])
     monkeypatch.setattr(ex, "fetch_sheet", fetch)
-    monkeypatch.setattr(ex, "count_rows", lambda conn, specs, s, e: {sp.name: 0 for sp in specs})
+    monkeypatch.setattr(ex, "count_rows", lambda conn, specs, s, e, filters=None: {sp.name: 0 for sp in specs})
 
 
 def test_build_workbook(tmp_path, monkeypatch):
@@ -99,9 +99,9 @@ def test_formula_injection(tmp_path, monkeypatch):
 
 
 def test_row_cap(tmp_path, monkeypatch):
-    monkeypatch.setattr(ex, "count_rows",
-                        lambda conn, specs, s, e: {sp.name: (ex.MAX_SHEET_ROWS + 1 if sp.name == "Odds" else 0)
-                                                   for sp in specs})
+    monkeypatch.setattr(ex, "fetch_sheet",
+                        lambda conn, spec, s, e, filters=None, cap=None:
+                        (list(spec.columns), [{}] * (ex.MAX_SHEET_ROWS + 1) if spec.name == "Odds" else []))
     with pytest.raises(ex.ExportTooLarge) as ei:
         ex.build_workbook(tmp_path / "x.xlsx", "2026-05-01", "2026-05-02", conn=object())
     assert "Odds" in str(ei.value) and "Odds" in ei.value.too_large
@@ -148,3 +148,66 @@ def test_count_odds_keys():
 def test_odds_sql_has_no_group_by():
     assert "GROUP BY" not in ex._ODDS_SQL.upper()
     assert "GROUP BY" not in ex._ODDS_KEYS_SQL.upper()
+
+
+def test_filtered_sql_markers():
+    for spec in ex.SHEETS:
+        for sql in (spec.sql, spec.count_sql):
+            out, params, _ = ex._filtered(sql, ex.NO_FILTERS)
+            assert "/*" not in out and params == {}
+    out, params, _ = ex._filtered(ex._ODDS_KEYS_SQL, ex.NO_FILTERS)
+    assert "/*" not in out and params == {}
+    f = ex.ExportFilters(countries=("Spain",), leagues=("La Liga",), umids=(1, 50))
+    odds, params, expanding = ex._filtered(ex._ODDS_SQL, f)
+    assert "g.country IN :f_countries" in odds and "g.league IN :f_leagues" in odds
+    assert "pm.umid IN :f_umids" in odds
+    assert sorted(expanding) == ["f_countries", "f_leagues", "f_umids"]
+    games = next(s for s in ex.SHEETS if s.name == "Games")
+    gsql, gparams, _ = ex._filtered(games.sql, f)
+    assert "g.country IN :f_countries" in gsql and "g.league IN :f_leagues" in gsql
+    assert "pm.umid" not in gsql and "f_umids" not in gparams
+    sofa, sparams, _ = ex._filtered(ex._SOFA_ODDS_SQL, f)
+    assert "so.market_id IN :f_sofa_markets" in sofa and sparams["f_sofa_markets"] == [1, 9]
+    sofa, sparams, _ = ex._filtered(ex._SOFA_ODDS_SQL, ex.ExportFilters(umids=(999,)))
+    assert "AND 1 = 0" in sofa and "f_sofa_markets" not in sparams
+
+
+def test_sheet_specs_selection():
+    assert [s.name for s in ex.sheet_specs(True, ("Odds", "Games"))] == ["Games", "Odds"]
+    with pytest.raises(ex.ExportFilterError):
+        ex.sheet_specs(True, ("Games", "Nope"))
+    with pytest.raises(ex.ExportFilterError, match="at least one"):
+        ex.sheet_specs(False, ("Odds",))
+
+
+def test_pivot_cap():
+    def gen():
+        for i in range(1, 6):
+            if i > 4:
+                raise AssertionError("consumed past the 4th row")
+            yield _row(i, 1, "home", None, "A", 2.0)
+    _, wide = ex.pivot_odds_rows(gen(), cap=2)
+    assert len(wide) == 3
+
+
+def test_build_passes_filters_and_skips_counting(tmp_path, monkeypatch):
+    seen = []
+
+    def fetch(conn, spec, start, end, filters=None, cap=None):
+        seen.append(filters)
+        return list(spec.columns), [{"game_id": 1}]
+    monkeypatch.setattr(ex, "fetch_sheet", fetch)
+    monkeypatch.setattr(ex, "count_rows", lambda *a, **k: pytest.fail("build must not count"))
+    f = ex.ExportFilters(sheets=("Games",))
+    out = tmp_path / "x.xlsx"
+    ex.build_workbook(out, "2026-05-01", "2026-05-02", conn=object(), filters=f)
+    wb = openpyxl.load_workbook(out)
+    assert wb.sheetnames == ["Summary", "Games"]
+    lines = {r[0].value: r[1].value for r in wb["Summary"].iter_rows(min_row=1, max_row=12) if r[0].value}
+    assert "Games" in lines["Sheets"]
+    assert seen == [f]
+
+
+def test_default_filename_filtered():
+    assert ex.default_filename("a", "b", True, filtered=True) == "pregames_a_to_b_filtered.xlsx"
+    assert ex.default_filename("a", "b", False, True) == "pregames_a_to_b_no-odds_filtered.xlsx"

@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import Callable
 
 import xlsxwriter
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from models import SofaStatistic
 
@@ -24,7 +24,7 @@ from models import SofaStatistic
 # reasonable, because XlsxWriter holds a sheet in memory.
 MAX_SHEET_ROWS = 500_000
 
-RANGE = "g.date_time_starts_utc >= :start AND g.date_time_starts_utc < :end"
+RANGE = "g.date_time_starts_utc >= :start AND g.date_time_starts_utc < :end /*GAME_FILTER*/"
 MATCH = "CONCAT(g.home_team, ' v ', g.away_team)"
 
 
@@ -49,15 +49,38 @@ class SheetSpec:
 class ExportTooLarge(Exception):
     def __init__(self, too_large: dict):
         self.too_large = too_large
-        parts = ", ".join(f"{n} has {c:,} rows" for n, c in too_large.items())
+        parts = ", ".join(f"{n} has more than {MAX_SHEET_ROWS:,} rows" for n in too_large)
         super().__init__(
             f"Too many rows for Excel: {parts} (max {MAX_SHEET_ROWS:,}). "
-            "Pick a shorter date range or leave out odds."
+            "Pick a shorter date range or leave out odds or add filters."
         )
 
 
 class ExportRangeError(ValueError):
     pass
+
+
+class ExportFilterError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class ExportFilters:
+    """Optional narrowing of an export. Empty tuple = no filter on that dimension."""
+    countries: tuple[str, ...] = ()
+    leagues: tuple[str, ...] = ()
+    umids: tuple[int, ...] = ()
+    sheets: tuple[str, ...] = ()      # data sheet names to include; empty = all
+
+    @property
+    def narrows_rows(self) -> bool:
+        return bool(self.countries or self.leagues or self.umids)
+
+
+NO_FILTERS = ExportFilters()
+
+# Our market id (umid) -> Sofascore market id. Mirrors the CASE in _ODDS_SQL; keep them in sync.
+UMID_TO_SOFA_MARKET = {1: 1, 2: 2, 4: 3, 6: 4, 3: 5, 50: 9, 53: 17, 58: 20, 55: 21}
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -111,7 +134,7 @@ def _max(a, b):
     return b if a is None else a if b is None else max(a, b)
 
 
-def pivot_odds_rows(rows) -> tuple[list[str], list[dict]]:
+def pivot_odds_rows(rows, cap: int | None = None) -> tuple[list[str], list[dict]]:
     """Group raw odds rows into one wide row per (game, market, outcome, line).
 
     Grouping happens here, not in MySQL: a GROUP BY over a week of selections spills
@@ -137,6 +160,8 @@ def pivot_odds_rows(rows) -> tuple[list[str], list[dict]]:
         w["_odds"][b] = _max(w["_odds"].get(b), r["odd"])
         w["sofa_close"] = _max(w["sofa_close"], r.get("sofa_close"))
         w["_win"] = _max(w["_win"], r.get("sofa_winning"))
+        if cap is not None and len(wide) > cap:
+            break
     bookmakers = sorted(books)
     out = []
     for w in wide.values():
@@ -184,8 +209,8 @@ def parse_range(date_from: str, date_to: str) -> tuple[datetime, datetime]:
     return start, end + timedelta(days=1)
 
 
-def default_filename(date_from, date_to, include_odds: bool = True) -> str:
-    suffix = "" if include_odds else "_no-odds"
+def default_filename(date_from, date_to, include_odds: bool = True, filtered: bool = False) -> str:
+    suffix = ("" if include_odds else "_no-odds") + ("_filtered" if filtered else "")
     return f"pregames_{date_from}_to_{date_to}{suffix}.xlsx"
 
 
@@ -298,7 +323,7 @@ LEFT JOIN sofa_odds so ON so.game_id = g.id
     END COLLATE utf8mb4_unicode_ci = s.canonical_outcome COLLATE utf8mb4_unicode_ci
     AND (so.choice_group COLLATE utf8mb4_unicode_ci = CAST(s.line_value AS CHAR)
          OR (so.choice_group IS NULL AND s.line_value IS NULL))
-WHERE {RANGE}
+WHERE {RANGE}/*MARKET_FILTER*/
 ORDER BY g.date_time_starts_utc, g.id, pm.umid, s.line_value, s.id
 """
 
@@ -306,7 +331,7 @@ _ODDS_KEYS_SQL = f"""
 SELECT g.id, pm.umid, COALESCE(s.canonical_outcome, s.raw_outcome), s.line_value
 FROM games g JOIN company_games cg ON cg.game_id = g.id
 JOIN pregame_markets pm ON pm.company_game_id = cg.id JOIN selections s ON s.market_id = pm.id
-WHERE {RANGE}
+WHERE {RANGE}/*MARKET_FILTER*/
 """
 
 _LADDER_SQL = f"""
@@ -319,7 +344,7 @@ JOIN pregame_markets pm ON pm.id = s.market_id
 JOIN company_games cg ON cg.id = pm.company_game_id
 JOIN games g ON g.id = cg.game_id
 LEFT JOIN market_types mt ON mt.umid = pm.umid
-WHERE {RANGE} AND (s.back_bpf_pos1 IS NOT NULL OR s.lay_bpf_pos1 IS NOT NULL)
+WHERE {RANGE}/*MARKET_FILTER*/ AND (s.back_bpf_pos1 IS NOT NULL OR s.lay_bpf_pos1 IS NOT NULL)
 ORDER BY g.date_time_starts_utc, g.id, cg.company_name, pm.umid, s.line_value, s.id
 """
 
@@ -328,7 +353,7 @@ SELECT g.id AS game_id, g.date_time_starts_utc AS kickoff, {MATCH} AS match_name
        so.market_id, so.market_name, so.market_group, so.market_period, so.choice_group, so.outcome,
        so.initial_odd, so.odd, so.winning, so.`change`
 FROM sofa_odds so JOIN games g ON g.id = so.game_id
-WHERE {RANGE}
+WHERE {RANGE}/*SOFA_MARKET_FILTER*/
 ORDER BY g.date_time_starts_utc, g.id, so.market_id, so.choice_group, so.id
 """
 
@@ -441,8 +466,44 @@ SHEETS: list[SheetSpec] = [
 ]
 
 
-def sheet_specs(include_odds: bool) -> list[SheetSpec]:
-    return [s for s in SHEETS if include_odds or not s.odds]
+DATA_SHEETS = [s.name for s in SHEETS]
+
+
+def sheet_specs(include_odds: bool, sheets: tuple[str, ...] = ()) -> list[SheetSpec]:
+    unknown = [n for n in sheets if n not in DATA_SHEETS]
+    if unknown:
+        raise ExportFilterError(f"Unknown sheet(s): {', '.join(unknown)}")
+    specs = [s for s in SHEETS if (include_odds or not s.odds) and (not sheets or s.name in sheets)]
+    if not specs:
+        raise ExportFilterError("Pick at least one sheet to export.")
+    return specs
+
+
+def _filtered(sql: str, f: ExportFilters) -> tuple[str, dict, list[str]]:
+    """Fill the filter markers. Returns (sql, extra params, names of list params needing expansion)."""
+    params: dict = {}
+    game = ""
+    if f.countries:
+        game += " AND g.country IN :f_countries"
+        params["f_countries"] = list(f.countries)
+    if f.leagues:
+        game += " AND g.league IN :f_leagues"
+        params["f_leagues"] = list(f.leagues)
+    market = sofa = ""
+    if f.umids:
+        market = " AND pm.umid IN :f_umids"
+        params["f_umids"] = list(f.umids)
+        sofa_ids = sorted({UMID_TO_SOFA_MARKET[u] for u in f.umids if u in UMID_TO_SOFA_MARKET})
+        if sofa_ids:
+            sofa = " AND so.market_id IN :f_sofa_markets"
+            params["f_sofa_markets"] = sofa_ids
+        else:
+            sofa = " AND 1 = 0"   # chosen markets have no Sofascore equivalent
+    sql = (sql.replace("/*GAME_FILTER*/", game)
+              .replace("/*MARKET_FILTER*/", market)
+              .replace("/*SOFA_MARKET_FILTER*/", sofa))
+    used = {k: v for k, v in params.items() if f":{k}" in sql}
+    return sql, used, list(used)
 
 
 # ── DB access ────────────────────────────────────────────────────────────────
@@ -457,27 +518,39 @@ def _params(spec: SheetSpec, start, end) -> dict:
     return {"start": start, "end": end} if spec.ranged else {}
 
 
-def count_rows(conn, specs, start, end) -> dict:
+def _stmt(sql: str, spec: "SheetSpec", start, end, f: ExportFilters, limit: int | None = None):
+    sql, extra, expanding = _filtered(sql, f)
+    if limit is not None:
+        sql = f"{sql.rstrip()}\nLIMIT {int(limit)}"
+    stmt = text(sql)
+    if expanding:
+        stmt = stmt.bindparams(*(bindparam(k, expanding=True) for k in expanding))
+    return stmt, {**_params(spec, start, end), **extra}
+
+
+def count_rows(conn, specs, start, end, filters: ExportFilters = NO_FILTERS) -> dict:
     out = {}
     for spec in specs:
         if spec.name == "Odds":
-            stmt = text(_ODDS_KEYS_SQL).execution_options(stream_results=True)
-            result = conn.execute(stmt, _params(spec, start, end))
+            stmt, params = _stmt(_ODDS_KEYS_SQL, spec, start, end, filters)
+            result = conn.execute(stmt.execution_options(stream_results=True), params)
             try:
                 out[spec.name] = count_odds_keys(result, MAX_SHEET_ROWS)
             finally:
                 result.close()
             continue
-        out[spec.name] = int(conn.execute(text(spec.count_sql), _params(spec, start, end)).scalar() or 0)
+        stmt, params = _stmt(spec.count_sql, spec, start, end, filters)
+        out[spec.name] = int(conn.execute(stmt, params).scalar() or 0)
     return out
 
 
-def fetch_sheet(conn, spec: SheetSpec, start, end):
+def fetch_sheet(conn, spec: SheetSpec, start, end, filters: ExportFilters = NO_FILTERS, cap: int | None = None):
     if spec.name == "Odds":
-        stmt = text(spec.sql).execution_options(stream_results=True)
-        result = conn.execute(stmt, _params(spec, start, end))
+        stmt, params = _stmt(spec.sql, spec, start, end, filters)
+        result = conn.execute(stmt.execution_options(stream_results=True), params)
         try:
-            bookmakers, wide = pivot_odds_rows({k: _clean(v) for k, v in m.items()} for m in result.mappings())
+            bookmakers, wide = pivot_odds_rows(
+                ({k: _clean(v) for k, v in m.items()} for m in result.mappings()), cap=cap)
         finally:
             result.close()
         cols = [
@@ -489,7 +562,8 @@ def fetch_sheet(conn, spec: SheetSpec, start, end):
             Col("sofa_close", "Sofa Closing Odds", "odds"), Col("sofa_result", "Sofa Result"),
         ]
         return cols, wide
-    result = conn.execute(text(spec.sql), _params(spec, start, end))
+    stmt, params = _stmt(spec.sql, spec, start, end, filters, limit=None if cap is None else cap + 1)
+    result = conn.execute(stmt, params)
     rows = [{k: _clean(v) for k, v in m.items()} for m in result.mappings()]
     if spec.transform:
         rows = [spec.transform(r) for r in rows]
@@ -513,6 +587,10 @@ def _col_width(col: Col, rows: list) -> float:
     return min(45, max(10, len(col.header) + 2, longest + 2))
 
 
+def _all_or(values) -> str:
+    return ", ".join(str(v) for v in values) if values else "All"
+
+
 def write_workbook(path, sheets, summary: dict) -> None:
     wb = xlsxwriter.Workbook(str(path), {
         "strings_to_formulas": False,
@@ -525,6 +603,7 @@ def write_workbook(path, sheets, summary: dict) -> None:
         fmt = {k: (wb.add_format({"num_format": v}) if v else None) for k, v in _NUM_FORMATS.items()}
         bold = wb.add_format({"bold": True})
         summary_ws = wb.add_worksheet("Summary")
+        summary_f = summary.get("filters") or NO_FILTERS
         for name, cols, rows in sheets:
             ws = wb.add_worksheet(name)
             if rows:
@@ -550,6 +629,10 @@ def write_workbook(path, sheets, summary: dict) -> None:
             ("Kickoff from", summary["date_from"]),
             ("Kickoff to", f"{summary['date_to']} (inclusive)"),
             ("Odds sheets", "Included" if summary["include_odds"] else "Not included"),
+            ("Countries", _all_or(summary_f.countries)),
+            ("Leagues", _all_or(summary_f.leagues)),
+            ("Market IDs", _all_or(summary_f.umids)),
+            ("Sheets", _all_or(summary_f.sheets)),
             ("Generated (UTC)", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")),
             ("Note", "Team Aliases and Market Types contain all rows (not date-filtered). Kickoff times are UTC."),
         ]
@@ -568,42 +651,45 @@ def write_workbook(path, sheets, summary: dict) -> None:
         wb.close()
 
 
-def preview(date_from: str, date_to: str, include_odds: bool = True, conn=None) -> dict:
+def preview(date_from: str, date_to: str, include_odds: bool = True, conn=None,
+            filters: ExportFilters = NO_FILTERS) -> dict:
     start, end = parse_range(date_from, date_to)
-    specs = sheet_specs(include_odds)
+    specs = sheet_specs(include_odds, filters.sheets)
     if conn is None:
         from database import engine  # lazy: keep this module importable without a DB
         with engine.connect() as c:
-            counts = count_rows(c, specs, start, end)
+            counts = count_rows(c, specs, start, end, filters)
     else:
-        counts = count_rows(conn, specs, start, end)
+        counts = count_rows(conn, specs, start, end, filters)
     too_large = [n for n, c in counts.items() if c > MAX_SHEET_ROWS]
     return {
         "date_from": date_from, "date_to": date_to, "include_odds": include_odds,
         "max_rows": MAX_SHEET_ROWS,
+        "filters": {"countries": list(filters.countries), "leagues": list(filters.leagues),
+                    "umids": list(filters.umids), "sheets": list(filters.sheets)},
         "sheets": [{"name": n, "rows": c} for n, c in counts.items()],
         "too_large": too_large, "ok": not too_large,
     }
 
 
-def build_workbook(path, date_from: str, date_to: str, include_odds: bool = True, conn=None) -> dict:
+def build_workbook(path, date_from: str, date_to: str, include_odds: bool = True, conn=None,
+                   filters: ExportFilters = NO_FILTERS) -> dict:
     start, end = parse_range(date_from, date_to)
-    specs = sheet_specs(include_odds)
+    specs = sheet_specs(include_odds, filters.sheets)
     own = conn is None
     if own:
         from database import engine
         conn = engine.connect()
     try:
-        counts = count_rows(conn, specs, start, end)
-        too_large = {n: c for n, c in counts.items() if c > MAX_SHEET_ROWS}
-        if too_large:
-            raise ExportTooLarge(too_large)
         sheets = []
         for spec in specs:
-            cols, rows = fetch_sheet(conn, spec, start, end)
+            cols, rows = fetch_sheet(conn, spec, start, end, filters=filters, cap=MAX_SHEET_ROWS)
+            if len(rows) > MAX_SHEET_ROWS:
+                raise ExportTooLarge({spec.name: len(rows)})
             sheets.append((spec.name, cols, rows))
     finally:
         if own:
             conn.close()
-    write_workbook(path, sheets, {"date_from": date_from, "date_to": date_to, "include_odds": include_odds})
+    write_workbook(path, sheets, {"date_from": date_from, "date_to": date_to, "include_odds": include_odds,
+                                  "filters": filters})
     return {name: len(rows) for name, _c, rows in sheets}

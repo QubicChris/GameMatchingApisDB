@@ -32,9 +32,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
-export function qs(params: Record<string, string | number | boolean | undefined | null>): string {
+type QsValue = string | number | boolean | undefined | null | (string | number)[];
+
+export function qs(params: Record<string, QsValue>): string {
   const sp = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null && v !== '') sp.set(k, String(v));
+  for (const [k, v] of Object.entries(params)) {
+    if (Array.isArray(v)) v.forEach((item) => sp.append(k, String(item)));
+    else if (v !== undefined && v !== null && v !== '') sp.set(k, String(v));
+  }
   return sp.toString();
 }
 

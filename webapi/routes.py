@@ -126,23 +126,37 @@ def match_rates():
 DATE_RE = r"^\d{4}-\d{2}-\d{2}$"
 
 
+def _export_filters(countries, leagues, umids, sheets) -> excel_export.ExportFilters:
+    return excel_export.ExportFilters(tuple(countries), tuple(leagues), tuple(umids), tuple(sheets))
+
+
 @router.get("/export/preview")
 def export_preview(date_from: str = Query(..., pattern=DATE_RE), date_to: str = Query(..., pattern=DATE_RE),
-                   include_odds: bool = True):
+                   include_odds: bool = True,
+                   countries: list[str] = Query(default=[], max_length=300),
+                   leagues: list[str] = Query(default=[], max_length=500),
+                   umids: list[int] = Query(default=[], max_length=200),
+                   sheets: list[str] = Query(default=[], max_length=20)):
+    f = _export_filters(countries, leagues, umids, sheets)
     try:
-        return excel_export.preview(date_from, date_to, include_odds)
-    except excel_export.ExportRangeError as e:
+        return excel_export.preview(date_from, date_to, include_odds, filters=f)
+    except (excel_export.ExportRangeError, excel_export.ExportFilterError) as e:
         raise HTTPException(400, str(e))
 
 
 @router.get("/export.xlsx")
 def export_xlsx(date_from: str = Query(..., pattern=DATE_RE), date_to: str = Query(..., pattern=DATE_RE),
-                include_odds: bool = True):
+                include_odds: bool = True,
+                countries: list[str] = Query(default=[], max_length=300),
+                leagues: list[str] = Query(default=[], max_length=500),
+                umids: list[int] = Query(default=[], max_length=200),
+                sheets: list[str] = Query(default=[], max_length=20)):
+    f = _export_filters(countries, leagues, umids, sheets)
     fd, tmp = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
     try:
-        excel_export.build_workbook(tmp, date_from, date_to, include_odds)
-    except excel_export.ExportRangeError as e:
+        excel_export.build_workbook(tmp, date_from, date_to, include_odds, filters=f)
+    except (excel_export.ExportRangeError, excel_export.ExportFilterError) as e:
         os.unlink(tmp)
         raise HTTPException(400, str(e))
     except excel_export.ExportTooLarge as e:
@@ -151,6 +165,7 @@ def export_xlsx(date_from: str = Query(..., pattern=DATE_RE), date_to: str = Que
     except Exception:
         os.unlink(tmp)
         raise
-    return FileResponse(tmp, filename=excel_export.default_filename(date_from, date_to, include_odds),
+    return FileResponse(tmp, filename=excel_export.default_filename(date_from, date_to, include_odds,
+                                                                    filtered=f.narrows_rows),
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         background=BackgroundTask(os.unlink, tmp))

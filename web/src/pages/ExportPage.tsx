@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
-  Alert, Badge, Button, Code, CopyButton, Group, List, Paper, Stack, Switch, Table, Text, Title,
+  Alert, Badge, Button, Checkbox, Code, CopyButton, Group, List, MultiSelect, Paper, SimpleGrid, Stack, Table,
+  Text, Title,
 } from '@mantine/core';
 import { DatePickerInput } from '@mantine/dates';
 import { notifications } from '@mantine/notifications';
@@ -9,7 +10,7 @@ import { IconCheck, IconCopy, IconDownload } from '@tabler/icons-react';
 import { api } from '../api/client';
 import { PageHeader } from '../components/PageHeader';
 import { QueryState } from '../components/QueryState';
-import { cliCommand, presetRange, type RangePreset } from '../lib/exportRanges';
+import { cliCommand, EXPORT_SHEETS, ODDS_SHEETS, presetRange, type RangePreset } from '../lib/exportRanges';
 import { formatNumber } from '../lib/format';
 
 const PRESETS: { label: string; value: RangePreset }[] = [
@@ -25,8 +26,34 @@ export function ExportPage() {
   const oldest = dates[dates.length - 1];
 
   const [range, setRange] = useState<[string | null, string | null]>([null, null]);
-  const [includeOdds, setIncludeOdds] = useState(true);
+  const [countries, setCountries] = useState<string[]>([]);
+  const [leagues, setLeagues] = useState<string[]>([]);
+  const [umids, setUmids] = useState<string[]>([]);
+  const [sheets, setSheets] = useState<string[]>([...EXPORT_SHEETS]);
   const [downloading, setDownloading] = useState(false);
+
+  const matchRates = useQuery({ queryKey: ['match-rates'], queryFn: api.matchRates });
+  const marketTypes = useQuery({ queryKey: ['market-types'], queryFn: api.marketTypes });
+
+  const leagueOptions = useMemo(() => {
+    const names = new Set<string>();
+    for (const l of matchRates.data?.leagues ?? []) {
+      if (countries.length === 0 || countries.includes(l.country)) names.add(l.league);
+    }
+    return [...names].sort((a, b) => a.localeCompare(b));
+  }, [matchRates.data, countries]);
+
+  useEffect(() => {
+    setLeagues((cur) => {
+      const next = cur.filter((l) => leagueOptions.includes(l));
+      return next.length === cur.length ? cur : next;
+    });
+  }, [leagueOptions]);
+
+  const marketOptions = (marketTypes.data ?? []).map((m) => ({
+    value: String(m.umid),
+    label: `${m.canonical_name ?? 'Market ' + m.umid} (#${m.umid})`,
+  }));
 
   useEffect(() => {
     if (range[0] == null && range[1] == null && dates.length > 0) {
@@ -36,19 +63,33 @@ export function ExportPage() {
 
   const [from, to] = range;
   const ready = !!from && !!to;
+  const noSheets = sheets.length === 0;
+
+  const params = {
+    date_from: from as string,
+    date_to: to as string,
+    include_odds: true,
+    countries,
+    leagues,
+    umids: umids.map(Number),
+    sheets: sheets.length === EXPORT_SHEETS.length ? [] : sheets,
+  };
 
   const preview = useQuery({
-    queryKey: ['export-preview', from, to, includeOdds],
-    queryFn: () => api.exportPreview({ date_from: from as string, date_to: to as string, include_odds: includeOdds }),
-    enabled: ready,
+    queryKey: ['export-preview', params],
+    queryFn: () => api.exportPreview(params),
+    enabled: ready && !noSheets,
   });
   const p = preview.data;
+  const cli = ready
+    ? cliCommand(from as string, to as string, { countries, leagues, umids: umids.map(Number), sheets })
+    : '';
 
   const download = async () => {
     if (!from || !to) return;
     setDownloading(true);
     try {
-      const { blob, filename } = await api.downloadExport({ date_from: from, date_to: to, include_odds: includeOdds });
+      const { blob, filename } = await api.downloadExport(params);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -99,12 +140,45 @@ export function ExportPage() {
                 </Button>
               ))}
             </Group>
-            <Switch
-              checked={includeOdds}
-              onChange={(e) => setIncludeOdds(e.currentTarget.checked)}
-              label="Include odds sheets (Odds, Exchange Ladder, Sofa Odds)"
-              description="Odds are large — turn off for long ranges."
+          </Stack>
+        </Paper>
+
+        <Paper withBorder p="lg">
+          <Title order={5} mb="sm">Filters</Title>
+          <Stack gap="sm">
+            <MultiSelect
+              label="Countries" placeholder="All countries"
+              data={filters.data?.countries ?? []} value={countries} onChange={setCountries}
+              searchable clearable
             />
+            <MultiSelect
+              label="Leagues" placeholder="All leagues"
+              data={leagueOptions} value={leagues} onChange={setLeagues}
+              searchable clearable
+            />
+            <MultiSelect
+              label="Markets" placeholder="All markets"
+              description="Applies to Odds, Exchange Ladder and Sofa Odds"
+              data={marketOptions} value={umids} onChange={setUmids}
+              searchable clearable
+            />
+            <Checkbox.Group label="Sheets" value={sheets} onChange={setSheets}>
+              <SimpleGrid cols={{ base: 1, sm: 2 }} mt="xs" spacing="xs">
+                {EXPORT_SHEETS.map((name) => (
+                  <Checkbox key={name} value={name} label={name} />
+                ))}
+              </SimpleGrid>
+            </Checkbox.Group>
+            <Group gap="xs">
+              <Button variant="default" size="xs" onClick={() => setSheets([...EXPORT_SHEETS])}>All</Button>
+              <Button
+                variant="default" size="xs"
+                onClick={() => setSheets(EXPORT_SHEETS.filter((n) => !ODDS_SHEETS.includes(n)))}
+              >
+                No odds sheets
+              </Button>
+            </Group>
+            {noSheets && <Text c="red" size="sm">Pick at least one sheet.</Text>}
           </Stack>
         </Paper>
 
@@ -141,7 +215,7 @@ export function ExportPage() {
                   </Text>
                   {!p.ok && (
                     <Alert color="red" title="Range too large for Excel">
-                      Shorten the date range or turn off odds sheets.
+                      Shorten the date range, add filters or leave out odds sheets.
                     </Alert>
                   )}
                 </Stack>
@@ -151,11 +225,14 @@ export function ExportPage() {
           <Group mt="md">
             <Button
               size="md" leftSection={<IconDownload size={18} />}
-              disabled={!p?.ok} loading={downloading} onClick={download}
+              disabled={!p?.ok || noSheets} loading={downloading} onClick={download}
             >
               Download Excel
             </Button>
           </Group>
+          <Text size="xs" c="dimmed" mt="xs">
+            Large exports can take a minute or two. Filters and fewer sheets make them faster.
+          </Text>
         </Paper>
 
         <Paper withBorder p="lg">
@@ -178,10 +255,10 @@ export function ExportPage() {
         {ready && (
           <Paper withBorder p="lg">
             <Title order={5} mb="sm">Command line</Title>
-            <CopyButton value={cliCommand(from as string, to as string, includeOdds)}>
+            <CopyButton value={cli}>
               {({ copied, copy }) => (
                 <Group wrap="nowrap" align="flex-start">
-                  <Code block style={{ flex: 1 }}>{cliCommand(from as string, to as string, includeOdds)}</Code>
+                  <Code block style={{ flex: 1 }}>{cli}</Code>
                   <Button
                     variant="default" size="xs" onClick={copy}
                     leftSection={copied ? <IconCheck size={14} /> : <IconCopy size={14} />}

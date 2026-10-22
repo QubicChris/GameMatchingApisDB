@@ -62,3 +62,24 @@ def test_export_preview_and_build(tmp_path):
     if odds_rows > 0:
         headers = [c.value for c in ws[1]]
         assert any(h.endswith(" Odds") and h not in ("Best Odds", "Sofa Closing Odds") for h in headers if h)
+
+
+def test_export_filters_on_seed(tmp_path):
+    import openpyxl
+
+    import excel_export
+    from excel_export import ExportFilters
+    from webapi import queries as q
+
+    d = q.load_filters()["dates"][0]
+    p = excel_export.preview(d, d, filters=ExportFilters(countries=("Devland",)))
+    rows = {s["name"]: s["rows"] for s in p["sheets"]}
+    assert (rows["Games"], rows["Odds"], rows["Sofa Odds"], rows["Incidents"]) == (1, 5, 5, 10)
+    p = excel_export.preview(d, d, filters=ExportFilters(countries=("Devland",), umids=(1,)))
+    rows = {s["name"]: s["rows"] for s in p["sheets"]}
+    assert rows["Odds"] == 3 and rows["Sofa Odds"] == 3
+    out = tmp_path / "f.xlsx"
+    excel_export.build_workbook(out, d, d, filters=ExportFilters(countries=("Devland",), sheets=("Games", "Odds")))
+    wb = openpyxl.load_workbook(out)
+    assert wb.sheetnames == ["Summary", "Games", "Odds"]
+    assert wb["Odds"].max_row - 1 == 5

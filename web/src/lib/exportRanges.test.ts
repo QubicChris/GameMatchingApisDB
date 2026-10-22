@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cliCommand, presetRange, rangeDays } from './exportRanges';
+import { cliCommand, EXPORT_SHEETS, presetRange, rangeDays } from './exportRanges';
 
 const dates = ['2026-05-16', '2026-05-15', '2026-04-01'];
 
@@ -19,11 +19,19 @@ describe('presetRange', () => {
 });
 
 describe('cliCommand', () => {
-  it('includes odds by default', () => {
-    expect(cliCommand('2026-05-01', '2026-05-07', true)).toBe('python export_excel.py --from 2026-05-01 --to 2026-05-07');
+  const base = 'python export_excel.py --from 2026-05-01 --to 2026-05-07';
+  it('has no extra flags without options', () => {
+    expect(cliCommand('2026-05-01', '2026-05-07')).toBe(base);
   });
-  it('adds --no-odds', () => {
-    expect(cliCommand('2026-05-01', '2026-05-07', false)).toBe('python export_excel.py --from 2026-05-01 --to 2026-05-07 --no-odds');
+  it('adds country and market flags', () => {
+    expect(cliCommand('2026-05-01', '2026-05-07', { countries: ['Saudi Arabia'], umids: [1, 50] }))
+      .toBe(`${base} --country "Saudi Arabia" --market 1 --market 50`);
+  });
+  it('omits --sheets when all sheets are selected', () => {
+    expect(cliCommand('2026-05-01', '2026-05-07', { sheets: [...EXPORT_SHEETS] })).toBe(base);
+  });
+  it('adds --sheets for a subset', () => {
+    expect(cliCommand('2026-05-01', '2026-05-07', { sheets: ['Games', 'Odds'] })).toBe(`${base} --sheets "Games,Odds"`);
   });
 });
 

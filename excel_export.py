@@ -64,6 +64,16 @@ class ExportFilterError(ValueError):
     pass
 
 
+class ExportCancelled(Exception):
+    """Raised from a progress callback to stop an export early."""
+
+
+# progress(stage, sheet, rows_done_in_this_stage_for_this_sheet)
+# stage is "fetching" | "writing" | "saving". The callback may raise ExportCancelled.
+ProgressFn = Callable[[str, "str | None", int], None]
+PROGRESS_EVERY = 5000
+
+
 @dataclass(frozen=True)
 class ExportFilters:
     """Optional narrowing of an export. Empty tuple = no filter on that dimension."""
@@ -134,7 +144,8 @@ def _max(a, b):
     return b if a is None else a if b is None else max(a, b)
 
 
-def pivot_odds_rows(rows, cap: int | None = None) -> tuple[list[str], list[dict]]:
+def pivot_odds_rows(rows, cap: int | None = None,
+                    progress: Callable[[int], None] | None = None) -> tuple[list[str], list[dict]]:
     """Group raw odds rows into one wide row per (game, market, outcome, line).
 
     Grouping happens here, not in MySQL: a GROUP BY over a week of selections spills
@@ -144,7 +155,11 @@ def pivot_odds_rows(rows, cap: int | None = None) -> tuple[list[str], list[dict]
     """
     books: set[str] = set()
     wide: dict = {}
+    consumed = 0
     for r in rows:
+        consumed += 1
+        if progress and consumed % PROGRESS_EVERY == 0:
+            progress(len(wide))
         key = (r["game_id"], r["umid"], r["outcome"], r["line_value"])
         w = wide.get(key)
         if w is None:
@@ -162,6 +177,8 @@ def pivot_odds_rows(rows, cap: int | None = None) -> tuple[list[str], list[dict]
         w["_win"] = _max(w["_win"], r.get("sofa_winning"))
         if cap is not None and len(wide) > cap:
             break
+    if progress:
+        progress(len(wide))
     bookmakers = sorted(books)
     out = []
     for w in wide.values():
@@ -544,13 +561,15 @@ def count_rows(conn, specs, start, end, filters: ExportFilters = NO_FILTERS) -> 
     return out
 
 
-def fetch_sheet(conn, spec: SheetSpec, start, end, filters: ExportFilters = NO_FILTERS, cap: int | None = None):
+def fetch_sheet(conn, spec: SheetSpec, start, end, filters: ExportFilters = NO_FILTERS, cap: int | None = None,
+                progress: ProgressFn | None = None):
     if spec.name == "Odds":
         stmt, params = _stmt(spec.sql, spec, start, end, filters)
         result = conn.execute(stmt.execution_options(stream_results=True), params)
         try:
             bookmakers, wide = pivot_odds_rows(
-                ({k: _clean(v) for k, v in m.items()} for m in result.mappings()), cap=cap)
+                ({k: _clean(v) for k, v in m.items()} for m in result.mappings()), cap=cap,
+                progress=(lambda n: progress("fetching", "Odds", n)) if progress else None)
         finally:
             result.close()
         cols = [
@@ -564,7 +583,13 @@ def fetch_sheet(conn, spec: SheetSpec, start, end, filters: ExportFilters = NO_F
         return cols, wide
     stmt, params = _stmt(spec.sql, spec, start, end, filters, limit=None if cap is None else cap + 1)
     result = conn.execute(stmt, params)
-    rows = [{k: _clean(v) for k, v in m.items()} for m in result.mappings()]
+    rows = []
+    for m in result.mappings():
+        rows.append({k: _clean(v) for k, v in m.items()})
+        if progress and len(rows) % PROGRESS_EVERY == 0:
+            progress("fetching", spec.name, len(rows))
+    if progress:
+        progress("fetching", spec.name, len(rows))
     if spec.transform:
         rows = [spec.transform(r) for r in rows]
     return list(spec.columns), rows
@@ -591,7 +616,7 @@ def _all_or(values) -> str:
     return ", ".join(str(v) for v in values) if values else "All"
 
 
-def write_workbook(path, sheets, summary: dict) -> None:
+def write_workbook(path, sheets, summary: dict, progress: ProgressFn | None = None) -> None:
     wb = xlsxwriter.Workbook(str(path), {
         "strings_to_formulas": False,
         "strings_to_urls": False,
@@ -612,8 +637,15 @@ def write_workbook(path, sheets, summary: dict) -> None:
                     "style": "Table Style Medium 2",
                     "columns": [{"header": c.header, **({"format": fmt[c.kind]} if fmt[c.kind] else {})}
                                 for c in cols],
-                    "data": [[r.get(c.key) for c in cols] for r in rows],
                 })
+                col_fmts = [fmt[c.kind] for c in cols]
+                for i, r in enumerate(rows, start=1):
+                    for j, c in enumerate(cols):
+                        ws.write(i, j, r.get(c.key), col_fmts[j])
+                    if progress and i % PROGRESS_EVERY == 0:
+                        progress("writing", name, i)
+                if progress:
+                    progress("writing", name, len(rows))
             else:
                 for i, c in enumerate(cols):
                     ws.write_string(0, i, c.header, bold)
@@ -647,6 +679,8 @@ def write_workbook(path, sheets, summary: dict) -> None:
             r += 1
             summary_ws.write_string(r, 0, name, bold)
             summary_ws.write_number(r, 1, len(rows))
+        if progress:
+            progress("saving", None, 0)
     finally:
         wb.close()
 
@@ -673,7 +707,7 @@ def preview(date_from: str, date_to: str, include_odds: bool = True, conn=None,
 
 
 def build_workbook(path, date_from: str, date_to: str, include_odds: bool = True, conn=None,
-                   filters: ExportFilters = NO_FILTERS) -> dict:
+                   filters: ExportFilters = NO_FILTERS, progress: ProgressFn | None = None) -> dict:
     start, end = parse_range(date_from, date_to)
     specs = sheet_specs(include_odds, filters.sheets)
     own = conn is None
@@ -683,7 +717,8 @@ def build_workbook(path, date_from: str, date_to: str, include_odds: bool = True
     try:
         sheets = []
         for spec in specs:
-            cols, rows = fetch_sheet(conn, spec, start, end, filters=filters, cap=MAX_SHEET_ROWS)
+            extra = {"progress": progress} if progress else {}   # only pass when used
+            cols, rows = fetch_sheet(conn, spec, start, end, filters=filters, cap=MAX_SHEET_ROWS, **extra)
             if len(rows) > MAX_SHEET_ROWS:
                 raise ExportTooLarge({spec.name: len(rows)})
             sheets.append((spec.name, cols, rows))
@@ -691,5 +726,5 @@ def build_workbook(path, date_from: str, date_to: str, include_odds: bool = True
         if own:
             conn.close()
     write_workbook(path, sheets, {"date_from": date_from, "date_to": date_to, "include_odds": include_odds,
-                                  "filters": filters})
+                                  "filters": filters}, progress=progress)
     return {name: len(rows) for name, _c, rows in sheets}

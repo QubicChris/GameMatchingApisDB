@@ -83,3 +83,28 @@ def test_export_filters_on_seed(tmp_path):
     wb = openpyxl.load_workbook(out)
     assert wb.sheetnames == ["Summary", "Games", "Odds"]
     assert wb["Odds"].max_row - 1 == 5
+
+
+def test_export_job_end_to_end(authed, tmp_path):
+    import time
+
+    import openpyxl
+
+    from webapi import queries as q
+
+    d = q.load_filters()["dates"][0]
+    r = authed.post("/api/export/jobs", json={"date_from": d, "date_to": d, "countries": ["Devland"],
+                                              "sheets": ["Games", "Odds"]})
+    assert r.status_code == 202
+    jid = r.json()["id"]
+    end = time.monotonic() + 60
+    body = r.json()
+    while time.monotonic() < end and body["state"] not in ("done", "error", "cancelled"):
+        time.sleep(0.2)
+        body = authed.get(f"/api/export/jobs/{jid}").json()
+    assert body["state"] == "done", body
+    f = authed.get(f"/api/export/jobs/{jid}/file")
+    assert f.status_code == 200
+    out = tmp_path / "job.xlsx"
+    out.write_bytes(f.content)
+    assert openpyxl.load_workbook(out).sheetnames == ["Summary", "Games", "Odds"]

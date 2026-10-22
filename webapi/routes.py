@@ -8,10 +8,11 @@ from typing import Literal
 
 import excel_export
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from webapi import queries
+from webapi import export_jobs, queries
 from webapi.auth import current_user
 
 logger = logging.getLogger(__name__)
@@ -139,9 +140,12 @@ def export_preview(date_from: str = Query(..., pattern=DATE_RE), date_to: str = 
                    sheets: list[str] = Query(default=[], max_length=20)):
     f = _export_filters(countries, leagues, umids, sheets)
     try:
-        return excel_export.preview(date_from, date_to, include_odds, filters=f)
+        result = excel_export.preview(date_from, date_to, include_odds, filters=f)
     except (excel_export.ExportRangeError, excel_export.ExportFilterError) as e:
         raise HTTPException(400, str(e))
+    export_jobs.remember_preview((date_from, date_to, include_odds, f),
+                                 {s["name"]: s["rows"] for s in result["sheets"]})
+    return result
 
 
 @router.get("/export.xlsx")
@@ -169,3 +173,57 @@ def export_xlsx(date_from: str = Query(..., pattern=DATE_RE), date_to: str = Que
                                                                     filtered=f.narrows_rows),
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         background=BackgroundTask(os.unlink, tmp))
+
+
+XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+class ExportJobIn(BaseModel):
+    date_from: str = Field(pattern=DATE_RE)
+    date_to: str = Field(pattern=DATE_RE)
+    include_odds: bool = True
+    countries: list[str] = Field(default_factory=list, max_length=300)
+    leagues: list[str] = Field(default_factory=list, max_length=500)
+    umids: list[int] = Field(default_factory=list, max_length=200)
+    sheets: list[str] = Field(default_factory=list, max_length=20)
+
+
+@router.post("/export/jobs", status_code=202)
+def export_job_start(body: ExportJobIn, user: dict = Depends(current_user)):
+    f = _export_filters(body.countries, body.leagues, body.umids, body.sheets)
+    try:
+        job = export_jobs.start_job(user["username"], body.date_from, body.date_to, body.include_odds, f)
+    except (excel_export.ExportRangeError, excel_export.ExportFilterError) as e:
+        raise HTTPException(400, str(e))
+    except export_jobs.ExportBusy as e:
+        raise HTTPException(429, str(e))
+    return export_jobs.status(job)
+
+
+@router.get("/export/jobs/{job_id}")
+def export_job_status(job_id: str, user: dict = Depends(current_user)):
+    try:
+        return export_jobs.status(export_jobs.get_job(job_id, user["username"]))
+    except KeyError:
+        raise HTTPException(404, "Export not found")
+
+
+@router.delete("/export/jobs/{job_id}", status_code=204)
+def export_job_cancel(job_id: str, user: dict = Depends(current_user)):
+    try:
+        export_jobs.cancel_job(job_id, user["username"])
+    except KeyError:
+        raise HTTPException(404, "Export not found")
+    return Response(status_code=204)
+
+
+@router.get("/export/jobs/{job_id}/file")
+def export_job_file(job_id: str, user: dict = Depends(current_user)):
+    try:
+        path, filename = export_jobs.take_file(job_id, user["username"])
+    except KeyError:
+        raise HTTPException(404, "Export not found")
+    except ValueError:
+        raise HTTPException(409, "Export is not ready")
+    return FileResponse(path, filename=filename, media_type=XLSX_TYPE,
+                        background=BackgroundTask(os.unlink, path))

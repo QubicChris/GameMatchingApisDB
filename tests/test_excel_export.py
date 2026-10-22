@@ -211,3 +211,33 @@ def test_build_passes_filters_and_skips_counting(tmp_path, monkeypatch):
 def test_default_filename_filtered():
     assert ex.default_filename("a", "b", True, filtered=True) == "pregames_a_to_b_filtered.xlsx"
     assert ex.default_filename("a", "b", False, True) == "pregames_a_to_b_no-odds_filtered.xlsx"
+
+
+def test_write_workbook_progress_and_cancel(tmp_path):
+    cols = [Col("a", "A", "int"), Col("b", "B")]
+    rows = [{"a": i, "b": f"x{i}"} for i in range(12_000)]
+    summary = {"date_from": "2026-05-01", "date_to": "2026-05-01", "include_odds": True, "filters": ex.NO_FILTERS}
+    calls = []
+    ex.write_workbook(tmp_path / "p.xlsx", [("Games", cols, rows)], summary, progress=lambda *a: calls.append(a))
+    assert ("writing", "Games", 5000) in calls
+    assert ("writing", "Games", 10000) in calls
+    assert ("writing", "Games", 12000) in calls
+    assert calls[-1] == ("saving", None, 0)
+
+    seen = []
+
+    def cancel_on_write(stage, sheet, n):
+        seen.append(stage)
+        if stage == "writing":
+            raise ex.ExportCancelled()
+    with pytest.raises(ex.ExportCancelled):
+        ex.write_workbook(tmp_path / "c.xlsx", [("Games", cols, rows)], summary, progress=cancel_on_write)
+    assert "saving" not in seen
+
+
+def test_pivot_progress():
+    raw = [_row(i, 1, "home", None, "bk", 2.0) for i in range(12_000)]
+    seen = []
+    _books, wide = ex.pivot_odds_rows(iter(raw), progress=seen.append)
+    assert seen == sorted(seen) and len(seen) >= 2
+    assert seen[-1] == len(wide) == 12_000

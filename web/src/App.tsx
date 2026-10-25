@@ -10,6 +10,7 @@ import { MatchRatesPage } from './pages/MatchRatesPage';
 import { AliasesPage } from './pages/AliasesPage';
 import { MarketTypesPage } from './pages/MarketTypesPage';
 import { ExportPage } from './pages/ExportPage';
+import { SofaSyncPage } from './pages/SofaSyncPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 export default function App() {
@@ -26,6 +27,7 @@ export default function App() {
           <Route path="aliases" element={<AliasesPage />} />
           <Route path="market-types" element={<MarketTypesPage />} />
           <Route path="export" element={<ExportPage />} />
+          <Route path="sofa-sync" element={<SofaSyncPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Route>
       </Route>

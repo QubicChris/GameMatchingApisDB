@@ -59,6 +59,24 @@ export interface ExportJob {
   sheet: string | null; percent: number; eta_seconds: number | null; elapsed_seconds: number;
   error: string | null; error_status: number | null; filename: string | null;
 }
+export interface SofaSyncWindow { last_completed: string | null; start: string | null; end: string | null; dates: number }
+export interface SofaSyncQuota { used: number | null; limit: number | null; cycle_start: string | null }
+export type SofaSyncOutcome = 'finished' | 'stopped' | 'busy' | 'error';
+export interface SofaSyncLastRun {
+  started_by: string; started_at: string; finished_at: string; exit_code: number | null;
+  outcome: SofaSyncOutcome; log_path: string;
+}
+export interface SofaSyncStatus {
+  running: boolean; started_here: boolean; started_by: string | null; started_at: string | null;
+  calls_this_run: number | null; dates_done_this_run: number | null;
+  window: SofaSyncWindow; quota: SofaSyncQuota; can_start: boolean; reason: string | null;
+  last_run: SofaSyncLastRun | null; log: string[];
+}
+export interface SofaSyncPlanRow { date: string; games: number; to_match: number; countries: number; max_calls: number }
+export interface SofaSyncPlan {
+  window: SofaSyncWindow; quota: SofaSyncQuota; rows: SofaSyncPlanRow[];
+  max_calls_total: number; calls_left: number | null;
+}
 export interface ExportPreview {
   date_from: string; date_to: string; include_odds: boolean; max_rows: number;
   sheets: { name: string; rows: number }[]; too_large: string[]; ok: boolean;

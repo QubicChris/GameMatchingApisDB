@@ -99,6 +99,9 @@ export function OverviewPage() {
                     );
                   })()
                 )}
+                <Anchor component={Link} to="/sofa-sync" size="sm" mt="xs" display="block">
+                  Fetch Sofa events →
+                </Anchor>
               </Paper>
             </>
           )}

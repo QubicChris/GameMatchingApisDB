@@ -6,7 +6,7 @@ import {
 } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import {
-  IconAbc, IconBallFootball, IconFileSpreadsheet, IconLayoutDashboard, IconListDetails, IconLogout,
+  IconAbc, IconBallFootball, IconCloudDownload, IconFileSpreadsheet, IconLayoutDashboard, IconListDetails, IconLogout,
   IconMoon, IconRefresh, IconSearch, IconSun, IconTrendingDown, IconWorld,
 } from '@tabler/icons-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -18,6 +18,7 @@ const NAV = [
   { label: 'Games', to: '/games', icon: IconBallFootball },
   { label: 'Blown Leads', to: '/blown-leads', icon: IconTrendingDown },
   { label: 'Match Rates', to: '/match-rates', icon: IconWorld },
+  { label: 'Sofa Sync', to: '/sofa-sync', icon: IconCloudDownload },
   { label: 'Team Aliases', to: '/aliases', icon: IconAbc },
   { label: 'Market Types', to: '/market-types', icon: IconListDetails },
   { label: 'Export', to: '/export', icon: IconFileSpreadsheet },

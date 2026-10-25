@@ -1,6 +1,6 @@
 import type {
   Aliases, BlownLead, DailyCount, ExportJob, ExportParams, ExportPreview, Filters, GameDetail, GameOdds,
-  GameRow, GamesParams, GameStatistics, Incident, MarketType, MatchRates, Summary, User,
+  GameRow, GamesParams, GameStatistics, Incident, MarketType, MatchRates, SofaSyncPlan, SofaSyncStatus, Summary, User,
 } from './types';
 
 export const UNAUTHORIZED_EVENT = 'pregames:unauthorized';
@@ -84,4 +84,8 @@ export const api = {
   cancelExport: (id: string) =>
     request<void>(`/api/export/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   downloadExportJob: (id: string) => fetchFile(`/api/export/jobs/${encodeURIComponent(id)}/file`),
+  sofaSync: () => request<SofaSyncStatus>('/api/sofa-sync'),
+  sofaSyncPlan: () => request<SofaSyncPlan>('/api/sofa-sync/plan'),
+  startSofaSync: () => request<SofaSyncStatus>('/api/sofa-sync/start', { method: 'POST' }),
+  stopSofaSync: () => request<SofaSyncStatus>('/api/sofa-sync/stop', { method: 'POST' }),
 };

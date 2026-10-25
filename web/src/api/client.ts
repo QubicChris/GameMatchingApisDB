@@ -1,5 +1,5 @@
 import type {
-  Aliases, BlownLead, DailyCount, ExportParams, ExportPreview, Filters, GameDetail, GameOdds,
+  Aliases, BlownLead, DailyCount, ExportJob, ExportParams, ExportPreview, Filters, GameDetail, GameOdds,
   GameRow, GamesParams, GameStatistics, Incident, MarketType, MatchRates, Summary, User,
 } from './types';
 
@@ -43,6 +43,18 @@ export function qs(params: Record<string, QsValue>): string {
   return sp.toString();
 }
 
+async function fetchFile(url: string): Promise<{ blob: Blob; filename: string }> {
+  const res = await fetch(url, { credentials: 'same-origin' });
+  if (!res.ok) {
+    const body = res.headers.get('content-type')?.includes('application/json') ? await res.json() : null;
+    if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    throw new ApiError(res.status, detailMessage(body, `${res.status} ${res.statusText}`));
+  }
+  const cd = res.headers.get('content-disposition') ?? '';
+  const filename = /filename="?([^";]+)"?/.exec(cd)?.[1] ?? 'pregames.xlsx';
+  return { blob: await res.blob(), filename };
+}
+
 export const api = {
   me: () => request<User>('/api/auth/me'),
   login: (username: string, password: string) =>
@@ -62,15 +74,14 @@ export const api = {
   blownLeads: (minLead: number) => request<BlownLead[]>(`/api/blown-leads?min_lead=${minLead}`),
   matchRates: () => request<MatchRates>('/api/match-rates'),
   exportPreview: (p: ExportParams) => request<ExportPreview>(`/api/export/preview?${qs({ ...p })}`),
-  async downloadExport(p: ExportParams): Promise<{ blob: Blob; filename: string }> {
-    const res = await fetch(`/api/export.xlsx?${qs({ ...p })}`, { credentials: 'same-origin' });
-    if (!res.ok) {
-      const body = res.headers.get('content-type')?.includes('application/json') ? await res.json() : null;
-      if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
-      throw new ApiError(res.status, detailMessage(body, `${res.status} ${res.statusText}`));
-    }
-    const cd = res.headers.get('content-disposition') ?? '';
-    const filename = /filename="?([^";]+)"?/.exec(cd)?.[1] ?? 'pregames.xlsx';
-    return { blob: await res.blob(), filename };
-  },
+  downloadExport: (p: ExportParams) => fetchFile(`/api/export.xlsx?${qs({ ...p })}`),
+  startExport: (p: ExportParams) =>
+    request<ExportJob>('/api/export/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ countries: [], leagues: [], umids: [], sheets: [], ...p }),
+    }),
+  exportJob: (id: string) => request<ExportJob>(`/api/export/jobs/${encodeURIComponent(id)}`),
+  cancelExport: (id: string) =>
+    request<void>(`/api/export/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  downloadExportJob: (id: string) => fetchFile(`/api/export/jobs/${encodeURIComponent(id)}/file`),
 };

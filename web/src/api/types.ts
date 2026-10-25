@@ -52,6 +52,13 @@ export interface ExportParams {
   date_from: string; date_to: string; include_odds: boolean;
   countries?: string[]; leagues?: string[]; umids?: number[]; sheets?: string[];
 }
+export type ExportJobState = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
+export interface ExportJob {
+  id: string; state: ExportJobState;
+  stage: 'queued' | 'counting' | 'fetching' | 'writing' | 'saving' | 'done';
+  sheet: string | null; percent: number; eta_seconds: number | null; elapsed_seconds: number;
+  error: string | null; error_status: number | null; filename: string | null;
+}
 export interface ExportPreview {
   date_from: string; date_to: string; include_odds: boolean; max_rows: number;
   sheets: { name: string; rows: number }[]; too_large: string[]; ok: boolean;

@@ -1,16 +1,17 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
-  Alert, Badge, Button, Checkbox, Code, CopyButton, Group, List, MultiSelect, Paper, SimpleGrid, Stack, Table,
-  Text, Title,
+  Alert, Badge, Button, Checkbox, Code, CopyButton, Group, List, MultiSelect, Paper, Progress, SimpleGrid, Stack,
+  Table, Text, Title,
 } from '@mantine/core';
 import { DatePickerInput } from '@mantine/dates';
 import { notifications } from '@mantine/notifications';
 import { IconCheck, IconCopy, IconDownload } from '@tabler/icons-react';
-import { api } from '../api/client';
+import { api, ApiError } from '../api/client';
 import { PageHeader } from '../components/PageHeader';
 import { QueryState } from '../components/QueryState';
 import { cliCommand, EXPORT_SHEETS, ODDS_SHEETS, presetRange, type RangePreset } from '../lib/exportRanges';
+import { formatEta, isActive, JOB_STORAGE_KEY, REVOKE_DELAY_MS, stageLabel } from '../lib/exportProgress';
 import { formatNumber } from '../lib/format';
 
 const PRESETS: { label: string; value: RangePreset }[] = [
@@ -30,7 +31,77 @@ export function ExportPage() {
   const [leagues, setLeagues] = useState<string[]>([]);
   const [umids, setUmids] = useState<string[]>([]);
   const [sheets, setSheets] = useState<string[]>([...EXPORT_SHEETS]);
-  const [downloading, setDownloading] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [jobError, setJobError] = useState<string | null>(null);
+  const [jobId, setJobId] = useState<string | null>(() => {
+    try { return sessionStorage.getItem(JOB_STORAGE_KEY); } catch { return null; }
+  });
+  const handledRef = useRef<string | null>(null);
+
+  const rememberJob = (id: string | null) => {
+    setJobId(id);
+    try {
+      if (id) sessionStorage.setItem(JOB_STORAGE_KEY, id);
+      else sessionStorage.removeItem(JOB_STORAGE_KEY);
+    } catch { /* storage unavailable */ }
+  };
+
+  const job = useQuery({
+    queryKey: ['export-job', jobId],
+    queryFn: () => api.exportJob(jobId as string),
+    enabled: !!jobId,
+    refetchInterval: (q) => (isActive(q.state.data) ? 1000 : false),
+    retry: false,
+  });
+  const jobData = job.data;
+  const busy = starting || isActive(jobData) || (!!jobId && job.isPending);
+
+  useEffect(() => {
+    if (job.error instanceof ApiError && job.error.status === 404) rememberJob(null);
+  }, [job.error]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!jobId || !jobData) return;
+    const key = `${jobId}:${jobData.state}`;
+    if (jobData.state === 'done') {
+      if (handledRef.current === key) return;
+      handledRef.current = key;
+      void (async () => {
+        try {
+          const { blob, filename } = await api.downloadExportJob(jobId);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS);
+          notifications.show({ color: 'teal', title: 'Export ready', message: filename });
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 404) {
+            notifications.show({ color: 'yellow', title: 'Export', message: 'This export was already downloaded' });
+          } else {
+            notifications.show({
+              color: 'red', title: 'Export failed', message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        } finally {
+          rememberJob(null);
+        }
+      })();
+    } else if (jobData.state === 'error') {
+      if (handledRef.current === key) return;
+      handledRef.current = key;
+      setJobError(jobData.error ?? 'Export failed');
+      rememberJob(null);
+    } else if (jobData.state === 'cancelled') {
+      if (handledRef.current === key) return;
+      handledRef.current = key;
+      notifications.show({ color: 'gray', title: 'Export', message: 'Export cancelled' });
+      rememberJob(null);
+    }
+  }, [jobId, jobData?.state]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const matchRates = useQuery({ queryKey: ['match-rates'], queryFn: api.matchRates });
   const marketTypes = useQuery({ queryKey: ['market-types'], queryFn: api.marketTypes });
@@ -87,24 +158,30 @@ export function ExportPage() {
 
   const download = async () => {
     if (!from || !to) return;
-    setDownloading(true);
+    setStarting(true);
+    setJobError(null);
     try {
-      const { blob, filename } = await api.downloadExport(params);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      notifications.show({ color: 'teal', title: 'Export ready', message: filename });
+      const j = await api.startExport(params);
+      rememberJob(j.id);
     } catch (err) {
       notifications.show({
         color: 'red', title: 'Export failed', message: err instanceof Error ? err.message : String(err),
       });
     } finally {
-      setDownloading(false);
+      setStarting(false);
+    }
+  };
+
+  const cancel = async () => {
+    if (!jobId) return;
+    try {
+      await api.cancelExport(jobId);
+    } catch (err) {
+      if (!(err instanceof ApiError && err.status === 404)) {
+        notifications.show({
+          color: 'red', title: 'Cancel failed', message: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   };
 
@@ -126,11 +203,12 @@ export function ExportPage() {
               maxDate={newest}
               valueFormat="D MMM YYYY"
               w={320}
+              disabled={busy}
             />
             <Group gap="xs">
               {PRESETS.map((pr) => (
                 <Button
-                  key={pr.value} variant="default" size="xs"
+                  key={pr.value} variant="default" size="xs" disabled={busy}
                   onClick={() => {
                     const r = presetRange(pr.value, dates);
                     if (r) setRange(r);
@@ -149,30 +227,32 @@ export function ExportPage() {
             <MultiSelect
               label="Countries" placeholder="All countries"
               data={filters.data?.countries ?? []} value={countries} onChange={setCountries}
-              searchable clearable
+              searchable clearable disabled={busy}
             />
             <MultiSelect
               label="Leagues" placeholder="All leagues"
               data={leagueOptions} value={leagues} onChange={setLeagues}
-              searchable clearable
+              searchable clearable disabled={busy}
             />
             <MultiSelect
               label="Markets" placeholder="All markets"
               description="Applies to Odds, Exchange Ladder and Sofa Odds"
               data={marketOptions} value={umids} onChange={setUmids}
-              searchable clearable
+              searchable clearable disabled={busy}
             />
             <Checkbox.Group label="Sheets" value={sheets} onChange={setSheets}>
               <SimpleGrid cols={{ base: 1, sm: 2 }} mt="xs" spacing="xs">
                 {EXPORT_SHEETS.map((name) => (
-                  <Checkbox key={name} value={name} label={name} />
+                  <Checkbox key={name} value={name} label={name} disabled={busy} />
                 ))}
               </SimpleGrid>
             </Checkbox.Group>
             <Group gap="xs">
-              <Button variant="default" size="xs" onClick={() => setSheets([...EXPORT_SHEETS])}>All</Button>
+              <Button variant="default" size="xs" disabled={busy} onClick={() => setSheets([...EXPORT_SHEETS])}>
+                All
+              </Button>
               <Button
-                variant="default" size="xs"
+                variant="default" size="xs" disabled={busy}
                 onClick={() => setSheets(EXPORT_SHEETS.filter((n) => !ODDS_SHEETS.includes(n)))}
               >
                 No odds sheets
@@ -222,17 +302,36 @@ export function ExportPage() {
               )}
             </QueryState>
           )}
+          {jobError && (
+            <Alert color="red" title="Export failed" mt="md" withCloseButton onClose={() => setJobError(null)}>
+              {jobError}
+            </Alert>
+          )}
           <Group mt="md">
             <Button
               size="md" leftSection={<IconDownload size={18} />}
-              disabled={!p?.ok || noSheets} loading={downloading} onClick={download}
+              disabled={!p?.ok || noSheets} loading={busy} onClick={download}
             >
               Download Excel
             </Button>
           </Group>
-          <Text size="xs" c="dimmed" mt="xs">
-            Large exports can take a minute or two. Filters and fewer sheets make them faster.
-          </Text>
+          {isActive(jobData) && jobData ? (
+            <Stack gap={4} mt="sm">
+              <Group justify="space-between">
+                <Text size="sm" fw={500}>{stageLabel(jobData)}</Text>
+                <Text size="sm" c="dimmed" className="num">{Math.round(jobData.percent)}%</Text>
+              </Group>
+              <Progress value={jobData.percent} size="lg" animated striped />
+              <Group justify="space-between">
+                <Text size="xs" c="dimmed">{formatEta(jobData.eta_seconds)}</Text>
+                <Button size="xs" variant="subtle" color="red" onClick={cancel}>Cancel</Button>
+              </Group>
+            </Stack>
+          ) : (
+            <Text size="xs" c="dimmed" mt="xs">
+              Large exports can take a minute or two. Filters and fewer sheets make them faster.
+            </Text>
+          )}
         </Paper>
 
         <Paper withBorder p="lg">

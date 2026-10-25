@@ -108,3 +108,20 @@ def test_export_job_end_to_end(authed, tmp_path):
     out = tmp_path / "job.xlsx"
     out.write_bytes(f.content)
     assert openpyxl.load_workbook(out).sheetnames == ["Summary", "Games", "Odds"]
+
+
+def test_auto_match_run_lock():
+    import auto_match_sofa
+    from webapi import sofa_sync
+
+    conn = auto_match_sofa.acquire_run_lock()
+    assert conn is not None
+    try:
+        assert auto_match_sofa.acquire_run_lock() is None
+        assert sofa_sync._lock_in_use() is True
+    finally:
+        auto_match_sofa.release_run_lock(conn)
+    assert sofa_sync._lock_in_use() is False
+    again = auto_match_sofa.acquire_run_lock()
+    assert again is not None
+    auto_match_sofa.release_run_lock(again)

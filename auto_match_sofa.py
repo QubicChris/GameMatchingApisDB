@@ -16,6 +16,8 @@ Usage:
     python auto_match_sofa.py                     # run until caught up or out of calls
     python auto_match_sofa.py --plan              # show what would run; no API calls
     python auto_match_sofa.py --start 2026-09-10  # start from this date instead
+
+Exit codes: 0 done or caught up, 3 another run holds the lock, 1 error.
 """
 import argparse
 import sys
@@ -26,9 +28,7 @@ from sqlalchemy import text
 import batch_match_sofa as bms
 from models import SofaMatchDate
 
-# Scheduled runs log to a file; keep ✓/✗/→ from failing on Windows' default encoding.
-sys.stdout.reconfigure(encoding="utf-8")
-sys.stderr.reconfigure(encoding="utf-8")
+LOCK_NAME = "pregames_auto_match"
 
 
 def calls_used() -> int:
@@ -55,7 +55,8 @@ def date_window(conn, start_override: date | None) -> tuple[date | None, date | 
     return last_done, start, end
 
 
-def print_plan(conn, start: date, end: date):
+def plan_rows(conn, start: date, end: date) -> list[dict]:
+    """Per kickoff date: games, games still to match (in callable countries), countries to call, max API calls."""
     rows = conn.execute(text("""
         SELECT DATE(date_time_starts_utc) AS d, country,
                COUNT(*) AS games, SUM(sofa_event_id IS NULL) AS unmatched
@@ -71,16 +72,44 @@ def print_plan(conn, start: date, end: date):
         per_date[r.d] = (games + r.games, unmatched + callable_unmatched,
                          countries + (1 if callable_unmatched else 0))
 
+    return [{"date": str(d), "games": games, "to_match": unmatched,
+             "countries": countries, "max_calls": countries + 3 * unmatched}
+            for d, (games, unmatched, countries) in sorted(per_date.items())]
+
+
+def print_plan(conn, start: date, end: date):
     print(f"  {'date':<12}{'games':>7}{'to match':>10}{'countries':>11}{'max calls':>11}")
     total = 0
-    for d, (games, unmatched, countries) in sorted(per_date.items()):
-        max_calls = countries + 3 * unmatched
-        total += max_calls
-        print(f"  {str(d):<12}{games:>7}{unmatched:>10}{countries:>11}{max_calls:>11}")
+    for r in plan_rows(conn, start, end):
+        total += r["max_calls"]
+        print(f"  {r['date']:<12}{r['games']:>7}{r['to_match']:>10}{r['countries']:>11}{r['max_calls']:>11}")
     print(f"  {'':<12}{'':>7}{'':>10}{'total':>11}{total:>11}   (upper bound: assumes every game matches)")
 
 
+def acquire_run_lock():
+    """Hold a MySQL named lock for the whole run so only one matcher runs at a time
+    (scheduled task, CLI or dashboard). Returns the connection holding it, or None if taken.
+    MySQL releases the lock automatically if this process dies."""
+    conn = bms.engine.connect()
+    got = conn.execute(text("SELECT GET_LOCK(:n, 0)"), {"n": LOCK_NAME}).scalar()
+    if got != 1:
+        conn.close()
+        return None
+    return conn
+
+
+def release_run_lock(conn) -> None:
+    try:
+        conn.execute(text("SELECT RELEASE_LOCK(:n)"), {"n": LOCK_NAME})
+    finally:
+        conn.close()
+
+
 def main():
+    # Scheduled runs log to a file; keep ✓/✗/→ from failing on Windows' default encoding.
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
     parser = argparse.ArgumentParser(description="Match Sofasport games day by day until the RapidAPI call limit")
     parser.add_argument("--plan", action="store_true", help="Show which dates would be processed; make no API calls")
     parser.add_argument("--start", type=date.fromisoformat, help="Start from this date (YYYY-MM-DD) instead of after the last completed one")
@@ -114,33 +143,40 @@ def main():
     if used < 0:
         sys.exit("  Could not read api_call_log — refusing to call the API without a quota count.")
 
-    d = start
-    while d <= end:
-        used = calls_used()
-        if used < 0:
-            sys.exit("  Could not read api_call_log — stopping.")
-        if used >= bms.MONTHLY_CALL_LIMIT:
-            print(f"\n  Call limit reached ({used}/{bms.MONTHLY_CALL_LIMIT}) — will continue from {d} next cycle.")
-            return
+    lock = acquire_run_lock()
+    if lock is None:
+        print("  Another auto-match run is already in progress — exiting.")
+        sys.exit(3)
+    try:
+        d = start
+        while d <= end:
+            used = calls_used()
+            if used < 0:
+                sys.exit("  Could not read api_call_log — stopping.")
+            if used >= bms.MONTHLY_CALL_LIMIT:
+                print(f"\n  Call limit reached ({used}/{bms.MONTHLY_CALL_LIMIT}) — will continue from {d} next cycle.")
+                return
 
-        result = bms.run(d.isoformat(), dry_run=False, unmatched_only=True,
-                         min_confidence=args.min_confidence, min_games=1, report=True,
-                         fetch_missing_details=True)
-        if result["hit_limit"]:
-            print(f"\n  Call limit reached during {d} — it will be resumed next cycle.")
-            return
+            result = bms.run(d.isoformat(), dry_run=False, unmatched_only=True,
+                             min_confidence=args.min_confidence, min_games=1, report=True,
+                             fetch_missing_details=True)
+            if result["hit_limit"]:
+                print(f"\n  Call limit reached during {d} — it will be resumed next cycle.")
+                return
 
-        with bms.engine.begin() as conn:
-            conn.execute(text("""
-                INSERT INTO sofa_match_dates (match_date, matched, missed, completed_at)
-                VALUES (:d, :matched, :missed, :now)
-                ON DUPLICATE KEY UPDATE matched = VALUES(matched), missed = VALUES(missed),
-                                        completed_at = VALUES(completed_at)
-            """), {"d": d, "matched": result["matched"], "missed": result["missed"], "now": datetime.utcnow()})
-        print(f"  ✓ {d} marked complete")
-        d += timedelta(days=1)
+            with bms.engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO sofa_match_dates (match_date, matched, missed, completed_at)
+                    VALUES (:d, :matched, :missed, :now)
+                    ON DUPLICATE KEY UPDATE matched = VALUES(matched), missed = VALUES(missed),
+                                            completed_at = VALUES(completed_at)
+                """), {"d": d, "matched": result["matched"], "missed": result["missed"], "now": datetime.utcnow()})
+            print(f"  ✓ {d} marked complete")
+            d += timedelta(days=1)
 
-    print(f"\n  Caught up to {end}. RapidAPI calls used: {calls_used()} / {bms.MONTHLY_CALL_LIMIT}")
+        print(f"\n  Caught up to {end}. RapidAPI calls used: {calls_used()} / {bms.MONTHLY_CALL_LIMIT}")
+    finally:
+        release_run_lock(lock)
 
 
 if __name__ == "__main__":

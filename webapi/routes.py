@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from webapi import export_jobs, queries
+from webapi import export_jobs, queries, sofa_sync
 from webapi.auth import current_user
 
 logger = logging.getLogger(__name__)
@@ -227,3 +227,31 @@ def export_job_file(job_id: str, user: dict = Depends(current_user)):
         raise HTTPException(409, "Export is not ready")
     return FileResponse(path, filename=filename, media_type=XLSX_TYPE,
                         background=BackgroundTask(os.unlink, path))
+
+
+@router.get("/sofa-sync")
+def sofa_sync_status():
+    return sofa_sync.status()
+
+
+@router.get("/sofa-sync/plan")
+def sofa_sync_plan():
+    return sofa_sync.plan()
+
+
+@router.post("/sofa-sync/start", status_code=202)
+def sofa_sync_start(user: dict = Depends(current_user)):
+    try:
+        return sofa_sync.start(user["username"])
+    except sofa_sync.SyncUnavailable as e:
+        raise HTTPException(503, str(e))
+    except sofa_sync.SyncConflict as e:
+        raise HTTPException(409, str(e))
+
+
+@router.post("/sofa-sync/stop")
+def sofa_sync_stop(user: dict = Depends(current_user)):
+    try:
+        return sofa_sync.stop(user["username"])
+    except sofa_sync.SyncConflict as e:
+        raise HTTPException(409, str(e))
